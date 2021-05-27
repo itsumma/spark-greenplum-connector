@@ -1,7 +1,9 @@
 package com.itsumma.gpconnector
 
+import org.apache.spark.sql.itsumma.gpconnector.GPOptionsFactory
+
 import java.nio.file.{Path, Paths}
-import java.sql.Connection
+import java.sql.{Connection, DriverManager}
 import scala.language.postfixOps
 import scala.util.Try
 
@@ -10,6 +12,12 @@ case object GPClient {
   import java.net.{InetAddress, InetSocketAddress, ServerSocket}
   import java.text.MessageFormat
   import java.util.UUID
+
+  def getConn(optionsFactory: GPOptionsFactory) : Connection = {
+    var conn = DriverManager.getConnection(optionsFactory.url, optionsFactory.user, optionsFactory.password)
+    conn.setTransactionIsolation(Connection.TRANSACTION_READ_COMMITTED)
+    conn
+  }
 
   def getUniqueFileName(directory: String, prefix: String, extension: Option[String] = None): Path = {
     val fileName = MessageFormat.format("{0}-{1}", prefix, UUID.randomUUID)
@@ -50,7 +58,7 @@ case object GPClient {
       closeable.close()
     }
 
-  def waitAndCopyRows(conn: Connection, sqlSelect: String, sqlInsert: String,
+  def waitNRowsAndExecute(conn: Connection, sqlSelect: String, sqlExec: String,
                       desiredRows: Int, deadlineSec: Long): Int = {
     val start = System.nanoTime()
     var elapsedTime: Long = 0
@@ -72,11 +80,15 @@ case object GPClient {
     }
     if (elapsedTime >= deadlineSec || nRowsAvailable < desiredRows) {
       println(s"----------- Aborted $sqlSelect | nRowsAvailable=$nRowsAvailable of $desiredRows, elapsedTime=$elapsedTime of $deadlineSec -----------")
-      return 0
+      return nRowsAvailable
+      throw new RuntimeException(s"----------- Aborted $sqlSelect | nRowsAvailable=$nRowsAvailable of $desiredRows, elapsedTime=$elapsedTime of $deadlineSec -----------")
     }
-    GPClient.using(conn.createStatement()) {
-      statement => statement.executeUpdate(sqlInsert)
-    }
+    if (sqlExec != null && sqlExec.nonEmpty)
+      GPClient.using(conn.createStatement()) {
+        statement => statement.executeUpdate(sqlExec)
+      }
+    println(s"----------- Success $sqlSelect | nRowsAvailable=$nRowsAvailable of $desiredRows, elapsedTime=$elapsedTime of $deadlineSec -----------")
+    nRowsAvailable
   }
 
   def tableExists(conn: Connection, table: String): Boolean = {
@@ -87,6 +99,10 @@ case object GPClient {
         statement.executeQuery()
       } finally {
         statement.close()
+        if (!conn.getAutoCommit) {
+          conn.clearWarnings()
+          conn.rollback()
+        }
       }
     }.isSuccess
   }

@@ -2,10 +2,9 @@ package org.apache.spark.sql.itsumma.gpconnector
 
 import java.sql.{Connection, Date, JDBCType, ResultSetMetaData, SQLException, Timestamp}
 import java.text.Format
-import java.time.ZoneId
+import java.time.{Instant, OffsetDateTime, ZoneId}
 import java.time.format.DateTimeFormatter
 import java.time.temporal._
-
 import com.itsumma.gpconnector.GPClient
 import org.apache.commons.lang.StringEscapeUtils
 import org.apache.commons.lang.time.FastDateFormat
@@ -13,39 +12,144 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils
 import SparkSchemaUtil.rightPadWithChar
+import org.apache.spark.sql.itsumma.gpconnector.GpTableTypes.GpTableType
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects}
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
+import scala.collection.mutable.{ListBuffer, HashMap => MutableHashMap, Set => MutableSet}
+import java.util
+
 //import org.apache.commons.lang.StringUtils.rightPad
 import SparkSchemaUtil.{escapeKey, isClass}
+
+case class GPColumnMeta(sqlTypeId: Int, dbTypeName: String, nullable: Int, colSize: Integer, decimalDigits: Integer) {}
+
+object GpTableTypes extends Enumeration {
+  type GpTableType = Value
+  val None, Target, ExternalReadable, ExternalWritable = Value
+}
 
 object SparkSchemaUtil {
 
   val ESCAPE_CHARACTER = "\""
   val NAME_SEPARATOR = "."
 
-  def getGreenplumTableColumns(schema: StructType, withTypes: Boolean): String = {
+  def getGreenplumTableMeta(connection: Connection, dbSchemaName: String, tableName: String): Map[String, GPColumnMeta] = {
+    val columnsMeta: MutableHashMap[String, GPColumnMeta] = MutableHashMap()
+    using(connection.getMetaData.getColumns(null, dbSchemaName, tableName, null)) {
+      rs => {
+        while (rs.next()) {
+          val colName = rs.getString("COLUMN_NAME")
+          var precision: Integer = rs.getInt("COLUMN_SIZE")
+          if (rs.wasNull())
+            precision = null
+          var scale: Integer = rs.getInt("DECIMAL_DIGITS")
+          if (rs.wasNull())
+            scale = null
+          val colMeta = GPColumnMeta(rs.getInt("DATA_TYPE"), rs.getString("TYPE_NAME"),
+            rs.getInt("NULLABLE"), precision, scale)
+          columnsMeta.put(colName, colMeta)
+        }
+      }
+    }
+    columnsMeta.toMap
+  }
+
+  def getGreenplumTableColumns(schema: StructType, forCreateTable: GpTableType, dbTableMeta: Map[String, GPColumnMeta] = null
+                              ): String = {
     val columns = new StringBuilder("")
     var i: Int = 0
     schema.foreach(f => {
       if (i > 0) columns.append(", ")
       columns.append(f.name)
-      if (withTypes) {
-        val dt: String =  f.dataType match {
+      if (forCreateTable != GpTableTypes.None) {
+        var dt: String =  f.dataType match {
           case StringType => "TEXT"
           case IntegerType => "INTEGER"
           case LongType => "BIGINT"
           case DoubleType => "DOUBLE PRECISION"
           case FloatType => "REAL"
           case ShortType => "INTEGER"
-          case ByteType => "BYTE"
-          case BooleanType => "BIT(1)"
-          case BinaryType => "BLOB"
+          case ByteType => "INTEGER" // type BYTE doesn't exists
+          case BooleanType => "BOOLEAN"
+          case BinaryType => {
+            forCreateTable match {
+              case GpTableTypes.ExternalReadable => "TEXT"
+              case GpTableTypes.ExternalWritable => "TEXT"
+              case _ => "BYTEA"
+            }
+          }
           case TimestampType => "TIMESTAMP"
           case DateType => "DATE"
           case t: DecimalType => s"DECIMAL(${t.precision},${t.scale})"
+        }
+        // External table column types overriding corresponding to the existing target table
+        if ((dbTableMeta != null) && dbTableMeta.contains(f.name)
+          && ((dt == "TEXT") || (f.dataType == BooleanType) || (f.dataType == BinaryType))) {
+          if (forCreateTable == GpTableTypes.ExternalReadable) {
+            dbTableMeta.get(f.name) match {
+              case Some(colMeta: GPColumnMeta) => {
+                colMeta.dbTypeName.toUpperCase match {
+                  case "UUID" => dt = "UUID"
+                  case "VARCHAR" | "CHARACTER VARYING" | "CHARACTER" | "CHAR" => if (colMeta.colSize != null) dt = s"VARCHAR(${colMeta.colSize})"
+                  case "INTEGER" => dt = "INTEGER"
+                  case "BIGINT" => dt = "BIGINT"
+                  case "DOUBLE PRECISION" => dt = "DOUBLE PRECISION"
+                  case "REAL" => dt = "REAL"
+                  // case "BYTE" => dt = "BYTE"
+                  case "BIT" | "BIT VARYING" | "VARBIT" => {
+                    dt = "VARCHAR(256)"
+                    /*
+                                      if (colMeta.colSize != null) {
+                                        dt = s"BIT(${colMeta.colSize})"
+                                      } else {
+                                        dt = "BIT(1)"
+                                      }
+                    */
+                  }
+                  case "BOOLEAN" => dt = "BOOLEAN"
+                  case "DECIMAL" => {
+                    if ((colMeta.colSize != null) && (colMeta.decimalDigits != null))
+                      dt = s"DECIMAL(${colMeta.colSize}.${colMeta.decimalDigits})"
+                  }
+                  case "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => {
+                    if (colMeta.colSize != null) {
+                      dt = s"TIMESTAMPTZ(${colMeta.colSize})"
+                    } else {
+                      dt = "TIMESTAMPTZ"
+                    }
+                  }
+                  case "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" => {
+                    if (colMeta.colSize != null) {
+                      dt = s"TIMESTAMP(${colMeta.colSize})"
+                    } else {
+                      dt = "TIMESTAMP"
+                    }
+                  }
+                  case "TIME WITH TIME ZONE" => {
+                    if (colMeta.colSize != null) {
+                      dt = s"TIME (${colMeta.colSize}) WITH TIME ZONE"
+                    } else {
+                      dt = "TIME WITH TIME ZONE"
+                    }
+                  }
+                  case "TIME" | "TIME WITHOUT TIME ZONE" => {
+                    if (colMeta.colSize != null) {
+                      dt = s"TIME(${colMeta.colSize})"
+                    } else {
+                      dt = "TIME"
+                    }
+                  }
+                  case "DATE" => dt = "DATE"
+                  case "GEOMETRY" => dt = "GEOMETRY"
+                  case _ =>
+                }
+              }
+              case None =>
+            }
+          }
         }
         columns.append(" ")
         columns.append(dt)
@@ -53,6 +157,73 @@ object SparkSchemaUtil {
       i += 1
     })
     columns.toString()
+  }
+
+  def getGreenplumSelectColumns(schema: StructType, fromTableOfType: GpTableType, dbTableMeta: Map[String, GPColumnMeta] = null): String = {
+    val columns = new StringBuilder("")
+    var i: Int = 0
+    schema.foreach(f => {
+      if (i > 0)
+        columns.append(", ")
+      var dt: String =  f.name
+      if (fromTableOfType == GpTableTypes.ExternalReadable) {
+        f.dataType match {
+          case BinaryType => dt = s"decode(${f.name}, 'base64')"
+          case BooleanType => {
+            if ((dbTableMeta != null) && dbTableMeta.contains(f.name)) {
+              dbTableMeta.get(f.name) match {
+                case Some(colMeta) => {
+                  if ((colMeta.dbTypeName.toUpperCase == "BIT") && (colMeta.colSize != null))
+                    dt = s"${f.name}::bit(${colMeta.colSize})"
+                }
+                case None =>
+              }
+            }
+          }
+          case StringType => {
+            if ((dbTableMeta != null) && dbTableMeta.contains(f.name)) {
+              dbTableMeta.get(f.name) match {
+                case Some(colMeta) => {
+                  if ((colMeta.dbTypeName.toUpperCase == "BIT")
+                  || (colMeta.dbTypeName.toUpperCase == "BIT VARYING")
+                    || (colMeta.dbTypeName.toUpperCase == "VARBIT")) {
+                    dt = s"${f.name}::varbit"
+/*
+                    if ((colMeta.colSize != null) && (colMeta.colSize > 0)) {
+                      dt = s"${f.name}::bit(${colMeta.colSize})"
+                    } else {
+                      dt = s"${f.name}::varbit"
+                    }
+*/
+                  }
+                }
+                case None =>
+              }
+            }
+          }
+          case _ =>
+        }
+      } else if (fromTableOfType == GpTableTypes.Target) {
+        f.dataType match {
+          case BinaryType => dt = s"encode(${f.name}, 'base64')"
+          case _ =>
+        }
+      }
+      columns.append(dt)
+      i += 1
+    })
+    columns.toString()
+  }
+
+  def getGreenplumPlaceholderSchema(optionsFactory: GPOptionsFactory): StructType = {
+    val fields: Array[StructField] = new Array[StructField](1)
+    val dialect: JdbcDialect = JdbcDialects.get(optionsFactory.getJDBCOptions("--").url)
+    val metadata = new MetadataBuilder().putLong("scale", 0)
+    val columnType =
+      dialect.getCatalystType(java.sql.Types.CHAR, "CHAR", 20, metadata).getOrElse(
+        getCatalystType(java.sql.Types.CHAR, 20, 0, false))
+    fields(0) = StructField("dummy", columnType, true)
+    new StructType(fields)
   }
 
   def getGreenplumTableSchema(optionsFactory: GPOptionsFactory,
@@ -101,7 +272,7 @@ object SparkSchemaUtil {
     }
   }
 
-  def getConn(optionsFactory: GPOptionsFactory): Connection =
+  private def getConn(optionsFactory: GPOptionsFactory): Connection =
     JdbcUtils.createConnectionFactory(optionsFactory.getJDBCOptions("--"))()
 
   def using[A, B <: {
@@ -196,10 +367,10 @@ object SparkSchemaUtil {
       case java.sql.Types.STRUCT        => StringType
       case java.sql.Types.TIME          => TimestampType
       case java.sql.Types.TIME_WITH_TIMEZONE
-      => null
+      => StringType //null
       case java.sql.Types.TIMESTAMP     => TimestampType
       case java.sql.Types.TIMESTAMP_WITH_TIMEZONE
-      => null
+      => StringType //null
       case java.sql.Types.TINYINT       => IntegerType
       case java.sql.Types.VARBINARY     => BinaryType
       case java.sql.Types.VARCHAR       => StringType
@@ -333,11 +504,59 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
     (filter.toString(), unsupportedFilters, filters diff unsupportedFilters)
   }
 
+  def internalRowToText(schema: StructType, row: InternalRow, fieldDelimiter: Char): String = {
+    if (schema.fields.length != row.numFields)
+      throw new SQLException(s"internalRowToText: schema.size=${schema.fields.length}, but ${row.numFields} data columns received")
+    val ret: StringBuilder = new StringBuilder("")
+    schema.fields.zipWithIndex.foreach{
+      case (field, i) => {
+        var txt = "NULL"
+        if (!row.isNullAt(i)) {
+          field.dataType match {
+            case StringType => txt = row.getString(i)
+            case DecimalType.Fixed(p, s) => {
+              val decVal = row.getDecimal(i, p, s)
+              txt = decVal.toString()
+            }
+            case DoubleType => txt = row.getDouble(i).toString
+            case FloatType => txt = row.getFloat(i).toString
+            case IntegerType => txt = row.getInt(i).toString
+            case LongType => txt = row.getLong(i).toString
+            case ShortType => txt = row.getShort(i).toString
+            case ByteType => txt = row.getByte(i).toString
+            case BooleanType => {
+              txt = if (row.getBoolean(i)) "1" else "0"
+            }
+            case TimestampType => {
+              val epochTime = row.getLong(i)/1000
+              val offsetDt: OffsetDateTime = Instant.ofEpochMilli(epochTime).atZone(ZoneId.of("UTC")).toOffsetDateTime
+              txt = timestampParseFormatTz.format(offsetDt)
+            }
+            case DateType => {
+              val epochDays = row.getInt(i)
+              val offsetDate: OffsetDateTime = Instant.ofEpochSecond(epochDays * 3600 * 24).atZone(ZoneId.of("UTC")).toOffsetDateTime
+              txt = dateParseFormat.format(offsetDate)
+            }
+            case BinaryType => {
+              //txt = "decode('" + new String(java.util.Base64.getEncoder.encode(row.getBinary(i))) + "','base64')"
+              txt = new String(java.util.Base64.getEncoder.encode(row.getBinary(i)))
+            }
+            case _ => throw new IllegalArgumentException(s"Unsupported type ${field.dataType.catalogString}")
+          }
+        }
+        if (i > 0)
+          ret.append(fieldDelimiter)
+        ret.append(txt)
+      }
+    }
+    ret.toString()
+  }
+
   ///TODO: Add more datatypes, e.g. ArrayType(et, _),
   // see https://github.com/apache/spark/blob/master/sql/core/src/main/scala/org/apache/spark/sql/execution/datasources/jdbc/JdbcUtils.scala
   def textToInternalRow(schema: StructType, fields: Array[String]): InternalRow = {
     if (schema.fields.length != fields.length)
-      throw new SQLException(s"schema.size=${schema.fields.length}, but ${fields.length} data columns received")
+      throw new SQLException(s"textToInternalRow: schema.size=${schema.fields.length}, but ${fields.length} data columns received")
     val row = new SpecificInternalRow(schema.fields.map(x => x.dataType))
     fields.zipWithIndex.foreach{ case(txt ,i) => {
       val isNull = txt.toLowerCase.equals("null") || txt.length == 0
@@ -374,7 +593,14 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
             val epochDay = ld.getLong(ChronoField.EPOCH_DAY)
             row.setInt(i, epochDay.toInt)
           }
-        case BooleanType => if (!isNull) row.setBoolean(i, txt.toBoolean) else row.setBoolean(i,false)
+        case BooleanType => {
+          if (!isNull) {
+            //row.setBoolean(i, txt.toBoolean)
+            row.setBoolean(i, List("true", "t", "1", "y", "yes").contains(txt.toLowerCase))
+          } else {
+            row.setBoolean(i, false)
+          }
+        }
         case DecimalType.Fixed(p, s) =>
           if (isNull) {
             row.update(i, BigDecimal.valueOf(0L))
@@ -391,6 +617,12 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
             row.update(i, Decimal(decimal, dt.precision, dt.scale))
           }
         */
+        case BinaryType => {
+          if (!isNull) {
+            row.update(i, java.util.Base64.getDecoder.decode(txt))
+            // row.update(i, UTF8String.fromString(txt))
+          }
+        }
         case _ => throw new IllegalArgumentException(s"Unsupported type ${schema.fields(i).dataType.catalogString}")
       }
       if (isNull)

@@ -5,7 +5,7 @@
 
     <groupId>com.itsumma</groupId>
     <artifactId>spark-greenplum-connector</artifactId>
-    <version>1.0</version>
+    <version>1.1</version>
 
     <properties>
         <final.name>scala-spark</final.name>

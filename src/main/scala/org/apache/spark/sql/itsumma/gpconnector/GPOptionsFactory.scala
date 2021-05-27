@@ -37,15 +37,39 @@ case object GPOptionsFactory {
 case class GPOptionsFactory(params: Map[String, String]) {
   require(params.contains("url"))
   require(params.contains("dbtable"))
+  private var nSeg: Int = params.getOrElse("partitions","0").toInt
   val gpfdistTimeout: Long = Utils.timeStringAsMs(params.getOrElse("server.timeout", "5m"))
   val tableOrQuery: String = params("dbtable")
   val driver: String = "org.postgresql.Driver"
   val partitionColumn: String = params.getOrElse("partitionColumn","") // gp_segment_id is the default
   val dbTimezone: String = params.getOrElse("dbTimezone", java.time.ZoneId.systemDefault.toString)
-  private var nSeg: Int = params.getOrElse("partitions","0").toInt
+  val url: String = params("url")
+  val user: String = params.getOrElse("user", null)
+  val password: String = params.getOrElse("password", null)
+  val serverPath: String = params.getOrElse("server.path", "/home/hadoop/hadoop/bin/gpfdist")
+  val serverPort: Int = params.getOrElse("server.port", "1808").toInt
+  val truncate: Boolean = params.getOrElse("truncate", "false").toBoolean
+  val distributedBy: String = params.getOrElse("distributedBy", null)
+  val dbSchema: String = params.getOrElse("dbschema", null)
 
   def getJDBCOptions(tableName: String = tableOrQuery): JDBCOptions = {
-    val excludeParams = Map("driver" -> "", "dbtable" -> "", "partitions" -> "", "partitionColumn"->"", "dbTimezone"->"")
+    val excludeParams = Map("driver" -> "", "dbtable" -> "", "partitions" -> "",
+      "dbschema" -> "",
+      "partitionColumn" -> "",
+      "dbTimezone" -> "",
+      "truncate" -> "",
+      "distributedBy" -> "",
+      "iteratorOptimization" -> "",
+      "server.path" -> "",
+      "server.port" -> "",
+      "server.useHostname" -> "",
+      "server.hostEnv" -> "",
+      "server.nic" -> "",
+      "server.timeout" -> "",
+      "pool.maxSize" -> "",
+      "pool.timeoutMs" -> "",
+      "pool.minIdle" -> ""
+    )
     new JDBCOptions(CaseInsensitiveMap(params
       -- excludeParams.keySet
       + ("driver" -> driver,

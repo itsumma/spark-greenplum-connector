@@ -1,8 +1,0 @@
-# 1.1 (2021-05-27)
-
-### New Features
-* Now it's ready to write using DSAPIv2!
-* Added support for Geometry type of PostGIS
-
-### Bug Fixes
-* Fixed work in a cluster mode

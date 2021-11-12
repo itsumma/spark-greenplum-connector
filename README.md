@@ -5,17 +5,16 @@
 ## Requirements
 
 1. Spark v2.*
-2. gpfdist executable from the greenplum distribution must be in the system path on every Spark executor node
 
 ## Features
 
-This repo is still an alpha version of the connector. You can use the connecter via DataSource API V2 either to read or to write to Greenplum database.
+You can use the connector via DataSource API V2 either to read or to write to Greenplum database.
 
 ### How to use
 
 1. Compile the library `mvn clean package`
-2. Copy jar-file to `/path/to/spark-greenplum-connector_2.11-1.1.jar` (replace /path/to to the installation path)
-3. In spark installation folder edit conf/spark-defaults.conf and place here:
+2. Copy jar-file from `spark-greenplum-connector/target/spark-greenplum-connector_2.11-2.0.jar` to `/path/to/spark-greenplum-connector_2.11-2.0.jar` (replace /path/to according your Spark jars folder path)
+3. Optionally, depending on your Spark installation, you may need to edit conf/spark-defaults.conf and place here:
 ```
 spark.driver.extraClassPath     /path/to/spark-greenplum-connector_2.11-1.1.jar
 spark.executor.extraClassPath     /path/to/spark-greenplum-connector_2.11-1.1.jar
@@ -29,20 +28,31 @@ scala> gpdf.show()
 scala> gpdf.count()
 ```
 
+You also may use arbitrary SQL queries instead of plain Greenplum table name: 
+```
+scala> val gpdf = spark.read.format("its-greenplum")
+    .option("url", "jdbc:postgresql://hostname:5432/database")
+    .option("user", "yourDbAccount")
+    .option( "password", "yourpassword")
+    .option("dbtable","SELECT * FROM pg_stat_activity").load()
+```
+
 To write to a database:
 
 Use your existing `gpdf` as a DataFrame object
 ```
-scala> gpdf.write.format("its-greenplum").option("url", "jdbc:postgresql://hostname:5432/database").option("user", "yourDbAccount").option( "password", "yourpassword").option("dbtable","table_name").mode(SaveMode.Append).save()
+scala> gpdf.write.format("its-greenplum").option("url", "jdbc:postgresql://hostname:5432/database").option("user", "yourDbAccount").option( "password", "yourpassword").option("dbtable","table_name").mode("append").save()
 ```
+
+5. Look scala source code in the test-app folder for complete usage example.
 
 ### Connector options
 
  - url - JDBC connection string URL
- - dbtable - gpdb table
+ - dbtable - Greenplum database table name or SQL query
  - user - gpdb user/role name
  - password - gpdb password for the user
- - server.path - path to gpfdist binary
+ - truncate - use `truncate table dbtable` SQL operator instead of drop/create to preserve the output table structure when `overwrite` mode specified for write operation. "true" or "false", default "false"
 
 
 ### Supported data types

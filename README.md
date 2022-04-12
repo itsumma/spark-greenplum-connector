@@ -1,4 +1,4 @@
-# DevOpsProdigy Spark Greenplum Connector
+# ITSumma Spark Greenplum Connector
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 

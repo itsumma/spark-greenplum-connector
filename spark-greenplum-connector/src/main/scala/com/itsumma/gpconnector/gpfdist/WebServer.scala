@@ -44,6 +44,7 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
     segmentQueues.clear()
     activeWriters.clear()
     allSegmentsDone.set(true)
+    executor.shutdown()
   }
 
   server.createContext("/", new HttpHandler() {
@@ -72,7 +73,7 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
           case values: List[String] => values.head.toInt
           case _ => 100000
         }
-      logger.info(s"Uri: ${uri.toString}, scheme: ${scheme}, method: ${method}, " +
+      logger.debug(s"Uri: ${uri.toString}, scheme: ${scheme}, method: ${method}, " +
         s"caller: ${exchange.getRemoteAddress}, segmentId: ${segmentId}, contentLength=${contentLength}")
       if (method == "get") {
         val responseHeaders = exchange.getResponseHeaders
@@ -86,7 +87,7 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
         exchange.sendResponseHeaders(200, 0)
         val os = exchange.getResponseBody
         //val nBytes = rmiSlave.size
-        //logger.info(s"segmentId=${segmentId} writing ${nBytes}")
+        //logger.debug(s"segmentId=${segmentId} writing ${nBytes}")
         val start = System.currentTimeMillis() // System.nanoTime() //
         var data = rmiSlave.get(10000)
         var nBytes: Long = 0
@@ -100,7 +101,7 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
         rmiLoopMs.addAndGet(ms)
         os.flush()
         os.close()
-        logger.info(s"GET for GP segment ${segmentId} complete in ${ms}/${System.currentTimeMillis() - start}ms, nBytes=${nBytes}")
+        logger.debug(s"GET for GP segment ${segmentId} complete in ${ms}/${System.currentTimeMillis() - start}ms, nBytes=${nBytes}")
       } else if (method == "post") me.synchronized {
         val passStart = System.currentTimeMillis()
         var rmiMsTotal: Long = 0
@@ -110,7 +111,7 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
             case values: List[String] => values.head.toInt
             case _ => throw new Exception(s"No X-GP-SEGMENT-COUNT")
           })
-          logger.info(s"Starting download for ${targetName} with segmentId=${segmentId}")
+          logger.debug(s"Starting download for ${targetName} with segmentId=${segmentId}")
         }
         var gpSeq: Int = 0
         if (headers.containsKey("X-gp-seq"))
@@ -151,14 +152,14 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
           while ((nRead > 0) && !jobAbort.get()) {
             nSlices += 1
 /*
-            logger.info(s"read: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
+            logger.debug(s"read: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
               s" slice=${nSlices} nRead=${nRead} " +
               //s"${convertBytesToHex(buff.slice(0, Math.min(nRead, 10)))} " +
               s".. ")
 */
             bytesReadTotal += nRead
             if ((bytesReadTotal < contentLength) && !jobAbort.get()) {
-              //logger.info(s"caller: ${exchange.getRemoteAddress} will block, bytesReadTotal=${bytesReadTotal}")
+              //logger.debug(s"caller: ${exchange.getRemoteAddress} will block, bytesReadTotal=${bytesReadTotal}")
               nRead = is.read(buff, prevLen + bytesReadTotal, contentLength - bytesReadTotal)
             } else {
               nRead = -1
@@ -177,12 +178,12 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
               //val data: String = new String(buff.slice(0, eolIx + 1), StandardCharsets.UTF_8)
               val data = buff.slice(0, eolIx + 1)
               val start = System.currentTimeMillis() // System.nanoTime() //
-              logger.info(s"write: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
+              logger.debug(s"write: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
                 s" nSlices=${nSlices} bytes=${data.length} " +
                 //s"${convertBytesToHex(data.slice(0, Math.min(data.length, 10)))} " +
                 s".. ")
               rmiSlave.write(data)
-              //logger.info(s"write: segment ${segmentId} ok")
+              //logger.debug(s"write: segment ${segmentId} ok")
               rmiLoopMs.addAndGet(System.currentTimeMillis() - start)
               rmiMsTotal += System.currentTimeMillis() - start
             } else {
@@ -219,20 +220,20 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
         os.flush()
         os.close()
         if (segmentDone == 0) {
-          logger.info(s"caller: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
+          logger.debug(s"caller: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
             s"pass=${segPass.getOrElse(segmentId, 0)} bytesReadPass=${bytesReadTotal} in " +
             s"timeMs=${System.currentTimeMillis() - passStart}, rmiMs=${rmiMsTotal}, nSlices=${nSlices}")
         } else {
           if (!transferComplete.get() && !jobAbort.get())
             rmiSlave.flush
-          logger.info(s"caller transfer complete: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
+          logger.debug(s"caller transfer complete: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
             s"pass=${segPass.getOrElse(segmentId, 0)} bytesReadPass=${bytesReadTotal}, nSlices=${nSlices}")
         }
         if (jobAbort.get() || allSegmentsDone.get()) {
           if (jobAbort.get()) {
-            logger.info(s"Query aborted, sent ${rCod} response code")
+            logger.debug(s"Query aborted, sent ${rCod} response code")
           } else {
-            logger.info(s"All segments done, sent ${rCod} response code")
+            logger.debug(s"All segments done, sent ${rCod} response code")
           }
           transferComplete.set(true)
         }

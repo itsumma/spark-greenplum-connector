@@ -1,0 +1,6 @@
+rootProject.name = 'spark-greenplum-connector-master'
+include ':spark-greenplum-connector'
+include ':test-app'
+
+project(':spark-greenplum-connector').projectDir = "$rootDir/spark-greenplum-connector" as File
+project(':test-app').projectDir = "$rootDir/test-app" as File

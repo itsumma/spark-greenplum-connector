@@ -12,8 +12,9 @@ import org.slf4j.LoggerFactory
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.util.concurrent.atomic.AtomicLong
+import scala.collection.mutable
 import scala.language.postfixOps
-import scala.collection.mutable.{ArrayBuffer, Queue}
+
 //import scala.util.control.Breaks
 
 // scalafix:off DisableSyntax.null
@@ -21,7 +22,6 @@ import scala.collection.mutable.{ArrayBuffer, Queue}
 
 class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
                                     queryId: String,
-                                    instanceUUID: String,
                                     schema: StructType,
                                     partitionNo: Int,
                                     rmiRegistry: String
@@ -37,18 +37,18 @@ class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
   if (schemaOrPlaceholder.isEmpty) {
     schemaOrPlaceholder = SparkSchemaUtil.getGreenplumPlaceholderSchema(optionsFactory)
   }
-  private val fieldDelimiter = '|'
-  private val lines = new Queue[InternalRow]()
+  private val fieldDelimiter = '\t'
+  private val lines = new mutable.Queue[InternalRow]()
   private var dataLine: InternalRow = null
   private val rowCount = new AtomicLong(0)
   private val rmiGetMs = new AtomicLong(0)
-  logger.info(s"${(System.currentTimeMillis() % 1000).toString} Creating GreenplumInputPartitionReader instance on executor ${exId} for partition ${partitionId}")
-  private val rmiSlave: RMISlave = new RMISlave(optionsFactory, rmiRegistry, queryId, true, exId, partitionNo, partitionId, stageId)
+  logger.debug(s"Creating GreenplumInputPartitionReader instance on executor ${exId} for partition ${partitionId}")
+  private var rmiSlave: RMISlave = new RMISlave(optionsFactory, rmiRegistry, queryId, true, exId, partitionNo, partitionId, stageId)
   private val gpfdistUrl: String = rmiSlave.gpfdistUrl
   if (rmiSlave.connected)
     rmiSlave.getSegServiceProvider
 
-  logger.info(s"${(System.currentTimeMillis() % 1000).toString} gpfdist started on ${gpfdistUrl}")
+  logger.debug(s"gpfdist started on ${gpfdistUrl}")
 
   var eofReached: Boolean = false
   private var nextSliceNo: Int = 0
@@ -62,16 +62,16 @@ class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
       return true
     } else {
       val waitStart = System.currentTimeMillis()
-      val newData: Array[Byte] = rmiSlave.get() // Locks here
+      val newData: Array[Byte] = rmiSlave.get(optionsFactory.gpfdistTimeout) // Locks here
       rmiGetMs.addAndGet(System.currentTimeMillis() - waitStart)
       if (newData == null || newData.isEmpty) { // End of stream
         eofReached = true
-        logger.info(s"${(System.currentTimeMillis() % 1000).toString} ${gpfdistUrl} end of stream, rowCount=${rowCount.get().toString}")
+        logger.info(s"${gpfdistUrl} end of stream, rowCount=${rowCount.get().toString}")
         return false
       }
       val newDataLen = newData.length
       nextSliceNo += 1
-      logger.info(s"next newData.size=${newDataLen}, sliceNo=${nextSliceNo}")
+      logger.debug(s"next newData.size=${newDataLen}, sliceNo=${nextSliceNo}")
 
       //val start = System.currentTimeMillis()
       var rowNum: Long = 0
@@ -97,7 +97,7 @@ class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
         throw new IOException(s"Unterminated row received after ${rowNum} rows")
       }
 
-      logger.info(s"next slice ${nextSliceNo} parsed with ${rowNum} rows, enqueueNs=${enqueueUs}, convNs=${convMs}")
+      logger.debug(s"next slice ${nextSliceNo} parsed with ${rowNum} rows, enqueueNs=${enqueueUs}, convNs=${convMs}")
       dataLine = lines.dequeue()
       true
     }
@@ -105,7 +105,7 @@ class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
 
   override def get(): InternalRow = this.synchronized {
     if (dataLine == null) {
-      logger.info(s"${(System.currentTimeMillis() % 1000).toString} ${gpfdistUrl} get returns null, rowCount=${rowCount.get().toString}")
+      logger.info(s"${gpfdistUrl} get returns null, rowCount=${rowCount.get().toString}")
       return null
     }
     rowCount.incrementAndGet()
@@ -113,21 +113,25 @@ class GreenplumInputPartitionReader(optionsFactory: GPOptionsFactory,
   }
 
   override def close(): Unit = synchronized {
+    if (rmiSlave == null)
+      return
     var rmiPutMs: Long = 0
     try {
-      if (rmiSlave.connected) {
+      if (rmiSlave.connected || rmiSlave.sqlTransferComplete.get()) {
         if (eofReached) {
-          rmiSlave.commit(rowCount.get()) // Will block until GPFDIST transfer complete
+          rmiSlave.commit(rowCount.get(), optionsFactory.networkTimeout) // Will block until GPFDIST transfer complete
         } else {
-          rmiSlave.abort(rowCount.get())
+          rmiSlave.abort(rowCount.get(), optionsFactory.networkTimeout)
         }
       }
     } catch {
-      case e: Exception => logger.error(s"${e.getMessage} ${e.getStackTrace}")
+      case e: Exception => logger.error(s"${e.getClass.getCanonicalName}:${e.getMessage} " +
+        s"${e.getStackTrace.mkString("", "\n", "")}")
     } finally {
       rmiPutMs = rmiSlave.stop
+      rmiSlave = null
     }
-    logger.info(s"${(System.currentTimeMillis() % 1000).toString} Destroyed ${gpfdistUrl}, " +
+    logger.info(s"Destroyed ${gpfdistUrl}, " +
       s"rowCount=${rowCount.get()}, rmiPutMs=${rmiPutMs}, rmiGetMs=${rmiGetMs.get()}")
     lines.clear()
   }

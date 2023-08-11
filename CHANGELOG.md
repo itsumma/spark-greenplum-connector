@@ -1,3 +1,13 @@
+# 2.1.0 (2023-08-11)
+### New Features
+* Spark Structured Streaming micro-batch mode support for read and write operations
+* Cooperative data processing on DB and Spark side
+* Utilisation of Spark data locality facilities (experimental)
+
+### Bug Fixes
+* Fixed memory leaks in driver and executor code
+* General stability improvements
+
 # 2.0.0 (2021-11-12)
 
 ### New Features

@@ -1,0 +1,34 @@
+allprojects  {
+  //apply plugin: 'maven'
+  group = 'com.itsumma'
+  version = '2.1.0'
+}
+
+subprojects {
+  apply plugin: 'java'
+  sourceCompatibility = 1.8
+  targetCompatibility = 1.8
+  tasks.withType(JavaCompile) {
+  	options.encoding = 'UTF-8'
+  }
+
+  
+  repositories {
+    mavenCentral()
+    //mavenLocal()
+    maven { url "https://repo.maven.apache.org/maven2" }
+  }
+
+  
+  dependencies {
+    implementation group: 'org.postgresql', name: 'postgresql', version:'42.4.3'
+    implementation group: 'com.typesafe.scala-logging', name: 'scala-logging_2.11', version:'3.8.0'
+//    testImplementation group: 'org.scalatest', name: 'scalatest_2.11', version:'3.1.1'
+    compileOnly group: 'org.scala-lang', name: 'scala-library', version:'2.11.12'
+    compileOnly group: 'org.apache.spark', name: 'spark-core_2.11', version:'2.4.7'
+    compileOnly group: 'org.apache.spark', name: 'spark-sql_2.11', version:'2.4.7'
+    compileOnly group: 'org.apache.spark', name: 'spark-catalyst_2.11', version:'2.4.7'
+    compileOnly group: 'org.apache.spark', name: 'spark-tags_2.11', version:'2.4.7'
+    }
+  
+}

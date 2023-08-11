@@ -6,7 +6,7 @@
     <groupId>com.itsumma</groupId>
     <artifactId>spark-greenplum-connector-master</artifactId>
     <packaging>pom</packaging>
-    <version>2.0.0</version>
+    <version>2.1.0</version>
     <modules>
         <module>spark-greenplum-connector</module>
         <module>test-app</module>
@@ -17,7 +17,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <jdk.version>1.8</jdk.version>
         <jdk.encoding>utf-8</jdk.encoding>
-        <spark.version>2.4.7</spark.version>
+        <spark.version>2.4.8</spark.version>
         <resource.encoding>utf-8</resource.encoding>
         <deploy.dir>../deploy</deploy.dir>
         <maven.compiler.source>1.8</maven.compiler.source>
@@ -26,10 +26,11 @@
         <geotools.version>14.5</geotools.version>
         <scala.version>2.11.12</scala.version>
         <scala.binary.version>2.11</scala.binary.version>
-        <project.binary.version>2.0</project.binary.version>
+        <project.binary.version>2.1</project.binary.version>
         <postgresql.ver>42.4.3</postgresql.ver>
-        <scala-maven-plugin.version>3.4.4</scala-maven-plugin.version>
-        <hadoop.version>3.2.4</hadoop.version>
+<!--        <scala-maven-plugin.version>4.5.4</scala-maven-plugin.version>-->
+        <scala-maven-plugin.version>3.3.1</scala-maven-plugin.version>
+        <hadoop.version>2.10.1</hadoop.version>
     </properties>
     <repositories>
         <repository>
@@ -63,25 +64,6 @@
             <version>${spark.version}</version>
             <scope>provided</scope>
         </dependency>
-
-
-<!--        <dependency>-->
-<!--            <groupId>org.apache.spark</groupId>-->
-<!--            <artifactId>spark-sql-kafka-0-10_${scala.version}</artifactId>-->
-<!--            <version>${spark.version}</version>-->
-<!--        </dependency>-->
-<!--        <dependency>-->
-<!--            <groupId>org.apache.spark</groupId>-->
-<!--            <artifactId>spark-streaming_${scala.version}</artifactId>-->
-<!--            <version>${spark.version}</version>-->
-<!--        </dependency>-->
-<!--        <dependency>-->
-<!--            <groupId>org.apache.spark</groupId>-->
-<!--            <artifactId>spark-streaming-kafka-0-10-assembly_${scala.version}</artifactId>-->
-<!--            <version>${spark.version}</version>-->
-<!--        </dependency>-->
-
-
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-catalyst_${scala.binary.version}</artifactId>
@@ -94,49 +76,20 @@
             <version>${spark.version}</version>
             <scope>provided</scope>
         </dependency>
-
-        <!-- Hadoop Dependencies -->
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-common</artifactId>
-            <version>${hadoop.version}</version>
-            <scope>provided</scope>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.xerial.snappy</groupId>
-                    <artifactId>snappy-java</artifactId>
-                </exclusion>
-            </exclusions>
-        </dependency>
-        <dependency>
-            <groupId>org.apache.hadoop</groupId>
-            <artifactId>hadoop-annotations</artifactId>
-            <version>${hadoop.version}</version>
-            <scope>provided</scope>
-        </dependency>
-
-
         <dependency>
             <groupId>com.typesafe.scala-logging</groupId>
             <artifactId>scala-logging_${scala.binary.version}</artifactId>
             <version>3.8.0</version>
             <scope>compile</scope>
         </dependency>
-
+<!--
         <dependency>
             <groupId>org.scalatest</groupId>
             <artifactId>scalatest_${scala.binary.version}</artifactId>
-            <!--<version>3.3.0-SNAP2</version>-->
             <version>3.1.1</version>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.apache.spark</groupId>
-            <artifactId>spark-yarn_${scala.binary.version}</artifactId>
-            <version>${spark.version}</version>
-            <scope>test</scope>
-        </dependency>
-
+-->
     </dependencies>
 
 </project>

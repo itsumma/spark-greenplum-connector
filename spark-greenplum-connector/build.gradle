@@ -1,0 +1,49 @@
+plugins {
+    id 'scala'
+    id 'java-library'
+    id 'maven-publish'
+    id 'com.github.johnrengelman.shadow' version '6.1.0'
+}
+
+group 'com.itsumma'
+version '2.1.0'
+
+def generatedResources = "$buildDir/generated-resources/main"
+
+sourceSets {
+    main {
+        scala {
+            srcDirs = ['src']
+            output.dir(generatedResources, builtBy: 'generateVersionProps')
+        }
+    }
+}
+
+dependencies {
+    implementation 'org.apache.commons:commons-dbcp2:2.9.0'
+}
+
+shadowJar {
+    archiveBaseName.set('spark-greenplum-connector_2.11')
+    archiveClassifier.set('')
+    archiveVersion.set('2.1')
+    minimize{
+        exclude(dependency('org.postgresql:.*:.*'))
+    }
+}
+
+task generateVersionProps {
+    doLast {
+        new File(generatedResources).mkdirs()
+        def generated = new File(generatedResources, "version.properties")
+        generated.text = """
+version=$rootProject.version
+artifactId=$project.name
+"""
+    }
+}
+
+task copyJarToBin(type: Copy) {
+    from shadowJar.outputs.getFiles()[0]
+    into "/home/hadoop/spark/jars"
+}

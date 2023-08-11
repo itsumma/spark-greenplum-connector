@@ -1,8 +1,13 @@
+.gradle
+/gradle
+gradlew*
 /target/**
 /spark-greenplum-connector/target/**
+/spark-greenplum-connector/build
 /.idea
 *.iml
 /test-app/target
+/test-app/build
 /.metals
 /.bloop
 .settings

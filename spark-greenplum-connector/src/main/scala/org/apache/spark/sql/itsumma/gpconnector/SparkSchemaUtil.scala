@@ -12,14 +12,14 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils
 import SparkSchemaUtil.rightPadWithChar
+import org.apache.spark.SparkContext
 import org.apache.spark.sql.itsumma.gpconnector.GpTableTypes.GpTableType
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects}
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-import scala.collection.mutable.{ListBuffer, HashMap => MutableHashMap, Set => MutableSet}
-import java.util
+import scala.collection.mutable.{HashMap => MutableHashMap}
 
 //import org.apache.commons.lang.StringUtils.rightPad
 import SparkSchemaUtil.{escapeKey, isClass}
@@ -27,6 +27,13 @@ import SparkSchemaUtil.{escapeKey, isClass}
 case class GPColumnMeta(sqlTypeId: Int, dbTypeName: String, nullable: Int, colSize: Integer, decimalDigits: Integer) {}
 
 object GpTableTypes extends Enumeration {
+  /**
+   * Denotes a type of Greenplum table, one of:
+   * <p><b>None</b> - means "Unspecified"
+   * <p><b>Target</b> - a table that can hold final source or destination data
+   * <p><b>ExternalReadable</b> - GP readable external table for GPFDIST protocol
+   * <p><b>ExternalWritable</b> - GP writable external table for GPFDIST protocol
+   */
   type GpTableType = Value
   val None, Target, ExternalReadable, ExternalWritable = Value
 }
@@ -36,9 +43,17 @@ object SparkSchemaUtil {
   val ESCAPE_CHARACTER = "\""
   val NAME_SEPARATOR = "."
 
+  /**
+   * Extracts Greenplum table columns metadata as a Map[column name String, {@link GPColumnMeta}]
+   * @param connection: GP database JDBC connection
+   * @param dbSchemaName: name of DB schema where target table resides
+   * @param tableName: name of the target table
+   * @return
+   */
   def getGreenplumTableMeta(connection: Connection, dbSchemaName: String, tableName: String): Map[String, GPColumnMeta] = {
     val columnsMeta: MutableHashMap[String, GPColumnMeta] = MutableHashMap()
-    using(connection.getMetaData.getColumns(null, dbSchemaName, tableName, null)) {
+    val schemaPattern: String = if (dbSchemaName == null || dbSchemaName.isEmpty) null else dbSchemaName
+    using(connection.getMetaData.getColumns(null, schemaPattern, tableName, null)) {
       rs => {
         while (rs.next()) {
           val colName = rs.getString("COLUMN_NAME")
@@ -57,6 +72,21 @@ object SparkSchemaUtil {
     columnsMeta.toMap
   }
 
+  /**
+   * Generates column list claus for
+   * <p>   CREATE TABLE SQL operator - when <b>forCreateTable</b> is one of (Target, ExternalReadable, ExternalWritable),
+   * <p>   or for
+   * <p>   INSERT SQL operator - when <b>forCreateTable</b> is None
+   * <p> In the case of CREATE TABLE operation, result contains corresponding column data type specifiers derived from
+   * the spark data source schema given by the <b>schema</b> parameter. An optional <b>dbTableMeta</b>,
+   *  parameter extracted from the Greenplum database object, if given, can be used to override data type of (some) columns
+   *  matching by column name with accordance to DB preferences, thus providing a mean for data type mapping
+   *  between Spark and GP data sources.
+   * @param schema: {@link StructType} - Spark data source schema
+   * @param forCreateTable: target table type ({@link GpTableType}): .None, ExternalReadable, ExternalWritable
+   * @param dbTableMeta: optional GP source metadata, can contain subset of target columns that require type mapping
+   * @return column list string
+   */
   def getGreenplumTableColumns(schema: StructType, forCreateTable: GpTableType, dbTableMeta: Map[String, GPColumnMeta] = null
                               ): String = {
     val columns = new StringBuilder("")
@@ -159,13 +189,29 @@ object SparkSchemaUtil {
     columns.toString()
   }
 
+  /**
+   * Generates column list claus for
+   * <p>   SELECT SQL operator - where <b>fromTableOfType</b> parameter can be one of (Target, ExternalReadable),
+   * <p> with every column from
+   * the spark data source schema given by the <b>schema</b> parameter.
+   * <p> An optional <b>dbTableMeta</b>,
+   * parameter extracted from the Greenplum database object, if given, can be used to override
+   * a data type of (some) columns
+   * matching by column name with accordance to DB preferences, thus providing a mean for data type mapping
+   * between Spark and GP data sources.
+   *
+   * @param schema         : {@link StructType} - Spark data source schema
+   * @param fromTableOfType : target table type ({@link GpTableType}), one of: None, ExternalReadable
+   * @param dbTableMeta    : optional GP source metadata, can contain subset of target columns that require type mapping
+   * @return column list string
+   */
   def getGreenplumSelectColumns(schema: StructType, fromTableOfType: GpTableType, dbTableMeta: Map[String, GPColumnMeta] = null): String = {
     val columns = new StringBuilder("")
     var i: Int = 0
     schema.foreach(f => {
       if (i > 0)
         columns.append(", ")
-      var dt: String =  f.name
+      var dt: String = f.name
       if (fromTableOfType == GpTableTypes.ExternalReadable) {
         f.dataType match {
           case BinaryType => dt = s"decode(${f.name}, 'base64')"
@@ -195,6 +241,10 @@ object SparkSchemaUtil {
                       dt = s"${f.name}::varbit"
                     }
 */
+                  } else if (colMeta.dbTypeName.toUpperCase == "JSON") {
+                    dt = s"${f.name}::json"
+                  } else if (colMeta.dbTypeName.toUpperCase == "JSONB") {
+                    dt = s"${f.name}::jsonb"
                   }
                 }
                 case None =>
@@ -209,12 +259,17 @@ object SparkSchemaUtil {
           case _ =>
         }
       }
-      columns.append(dt)
+      columns.append(s"$dt as ${f.name}")
       i += 1
     })
     columns.toString()
   }
 
+  /**
+   * Produce dummy fake data scheme required for the count of rows operation.
+   * @param optionsFactory
+   * @return
+   */
   def getGreenplumPlaceholderSchema(optionsFactory: GPOptionsFactory): StructType = {
     val fields: Array[StructField] = new Array[StructField](1)
     val dialect: JdbcDialect = JdbcDialects.get(optionsFactory.getJDBCOptions("--").url)
@@ -226,56 +281,74 @@ object SparkSchemaUtil {
     new StructType(fields)
   }
 
+  /**
+   * Extracts columns metadata list as {@link StructType} instance (i.e. Spark-native data schema representation)
+   * from the GP data source given by <b>tableOrQuery</b> parameter,
+   * <p>which can be a table name or SQL SELECT operator.
+   * <p>No actual data result set is generated, the statement for <b>tableOrQuery</b> is only prepared.
+   * <p> <b>Note</b>: this method will commit previous transaction (if any) on the <b>conn</b>
+   * @param optionsFactory - can pass usual JDBC options influencing the statement prepare stage.
+   * @param conn: GP DB connection
+   * @param tableOrQuery: Greenplum table name or SELECT operator that can produce a result set
+   * @param alwaysNullable optional: enforce all columns in the result to be marked as nullable
+   * @return {@link StructType} instance with column list metadata
+   */
   def getGreenplumTableSchema(optionsFactory: GPOptionsFactory,
+                              conn: Connection,
                               tableOrQuery: String,
                               alwaysNullable: Boolean = false): StructType = {
-    using(getConn(optionsFactory)) { conn => {
-      JdbcUtils.getSchemaOption(conn, optionsFactory.getJDBCOptions(tableOrQuery)) match {
-        case Some(schema) => schema
-        case None => {
-          var sql: String = tableOrQuery
-          if (!tableOrQuery.contains(" ") && GPClient.tableExists(conn, tableOrQuery)) {
-            sql = s"select * from $tableOrQuery"
-          }
-          using(conn.prepareStatement(sql)) {
-            stmt => {
-              val rsmd = stmt.getMetaData
-              val colCount = rsmd.getColumnCount
-              val fields: Array[StructField] = new Array[StructField](colCount)
-              var i: Int = 0
-              val dialect: JdbcDialect = JdbcDialects.get(optionsFactory.getJDBCOptions("--").url)
-              while (i < colCount) {
-                val columnName = rsmd.getColumnLabel(i + 1)
-                val dataType = rsmd.getColumnType(i + 1)
-                val typeName = rsmd.getColumnTypeName(i + 1)
-                val fieldSize = rsmd.getPrecision(i + 1)
-                val fieldScale = rsmd.getScale(i + 1)
-                val isSigned = rsmd.isSigned(i + 1)
-                val nullable = if (alwaysNullable) {
-                  true
-                } else {
-                  rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
-                }
-                val metadata = new MetadataBuilder().putLong("scale", fieldScale)
-                val columnType =
-                  dialect.getCatalystType(dataType, typeName, fieldSize, metadata).getOrElse(
-                    getCatalystType(dataType, fieldSize, fieldScale, isSigned))
-                fields(i) = StructField(columnName, columnType, nullable)
-                i += 1
+    if (!conn.getAutoCommit)
+      conn.commit()
+    JdbcUtils.getSchemaOption(conn, optionsFactory.getJDBCOptions(tableOrQuery)) match {
+      case Some(schema) => schema
+      case None => {
+        val targetType: GPTarget = GPTarget(tableOrQuery)
+        var sql: String = tableOrQuery
+        if (!targetType.isQuery) {
+          if (GPClient.tableExists(conn, tableOrQuery)) sql = s"select * from $tableOrQuery"
+          else return new StructType()
+        }
+        if (!conn.getAutoCommit)
+          conn.commit()
+        using(conn.prepareStatement(sql)) {
+          stmt => {
+            val rsmd = stmt.getMetaData
+            val colCount = rsmd.getColumnCount
+            val fields: Array[StructField] = new Array[StructField](colCount)
+            var i: Int = 0
+            val dialect: JdbcDialect = JdbcDialects.get(optionsFactory.getJDBCOptions("--").url)
+            while (i < colCount) {
+              val columnName = rsmd.getColumnLabel(i + 1)
+              val dataType = rsmd.getColumnType(i + 1)
+              val typeName = rsmd.getColumnTypeName(i + 1)
+              val fieldSize = rsmd.getPrecision(i + 1)
+              val fieldScale = rsmd.getScale(i + 1)
+              val isSigned = rsmd.isSigned(i + 1)
+              val nullable = if (alwaysNullable) {
+                true
+              } else {
+                rsmd.isNullable(i + 1) != ResultSetMetaData.columnNoNulls
               }
-              new StructType(fields)
+              val metadata = new MetadataBuilder().putLong("scale", fieldScale)
+              val columnType =
+                dialect.getCatalystType(dataType, typeName, fieldSize, metadata).getOrElse(
+                  getCatalystType(dataType, fieldSize, fieldScale, isSigned))
+              fields(i) = StructField(columnName, columnType, nullable)
+              i += 1
             }
+            new StructType(fields)
           }
         }
       }
     }
-    }
   }
 
+/*
   private def getConn(optionsFactory: GPOptionsFactory): Connection =
     JdbcUtils.createConnectionFactory(optionsFactory.getJDBCOptions("--"))()
+*/
 
-  def using[A, B <: {
+  private def using[A, B <: {
     def close(): Unit
   }](closeable: B)(f: B => A): A =
     try {
@@ -306,13 +379,13 @@ object SparkSchemaUtil {
     getEscapedArgument(columnFamily) + NAME_SEPARATOR + getEscapedArgument(columnName)
   }
 
-  def stripChars(s: String, ch: String) = s filterNot (ch contains _)
+  def stripChars(s: String, ch: String): String = s filterNot (ch contains _)
 
   // Helper function to escape column key to work with SQL queries
   private def escapeKey(key: String): String = getEscapedFullColumnName(key)
 
   private def isClass(obj: Any, className: String) = {
-    className.equals(obj.getClass().getName())
+    className.equals(obj.getClass.getName)
   }
 
   /**
@@ -392,6 +465,17 @@ object SparkSchemaUtil {
     if (len <= 0)
       return str
     str + repeatChar(c, len)
+  }
+
+  def guessMaxParallelTasks(): Int = {
+    val sparkContext = SparkContext.getOrCreate
+    var guess: Int = -1
+    while ((guess <= 0) && !Thread.currentThread().isInterrupted) {
+      guess = sparkContext.getExecutorMemoryStatus.keys.size - 1
+      if (sparkContext.deployMode == "cluster")
+        guess -= 1
+    }
+    guess
   }
 
 }
@@ -504,7 +588,7 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
     (filter.toString(), unsupportedFilters, filters diff unsupportedFilters)
   }
 
-  def internalRowToText(schema: StructType, row: InternalRow, fieldDelimiter: Char): String = {
+  def internalRowToText(schema: StructType, row: InternalRow, fieldDelimiter: Char = '\t'): String = {
     if (schema.fields.length != row.numFields)
       throw new SQLException(s"internalRowToText: schema.size=${schema.fields.length}, but ${row.numFields} data columns received")
     val ret: StringBuilder = new StringBuilder("")
@@ -513,7 +597,11 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
         var txt = "NULL"
         if (!row.isNullAt(i)) {
           field.dataType match {
-            case StringType => txt = row.getString(i)
+            case StringType => {
+              txt = StringEscapeUtils.escapeJava(row.getString(i)).replace("\\\"", "\"")
+              if (fieldDelimiter != '\t')
+                txt = txt.replace(s"${fieldDelimiter}", s"\\${fieldDelimiter}")
+            }
             case DecimalType.Fixed(p, s) => {
               val decVal = row.getDecimal(i, p, s)
               txt = decVal.toString()
@@ -559,9 +647,12 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
       throw new SQLException(s"textToInternalRow: schema.size=${schema.fields.length}, but ${fields.length} data columns received")
     val row = new SpecificInternalRow(schema.fields.map(x => x.dataType))
     fields.zipWithIndex.foreach{ case(txt ,i) => {
-      val isNull = txt.toLowerCase.equals("null") || txt.length == 0
+      val isNull = txt.toLowerCase.equals("null") || txt.isEmpty
       schema.fields(i).dataType match {
-        case StringType => if (!isNull) row.update(i, UTF8String.fromString(txt)) else row.update(i, UTF8String.fromString(""))
+        case StringType => {
+          if (!isNull) row.update(i, UTF8String.fromString(StringEscapeUtils.unescapeJava(txt)))
+          else row.update(i, UTF8String.fromString(""))
+        }
         case DoubleType => if (!isNull) row.setDouble(i, txt.toDouble) else row.setDouble(i, 0.0)
         case FloatType => if (!isNull) row.setFloat(i, txt.toFloat) else row.setFloat(i, 0.0f)
         case IntegerType => if (!isNull) row.setInt(i, txt.toInt) else row.setInt(i, 0)

@@ -1,3 +1,9 @@
+# 3.1.0 (2024-02-27)
+### New Features
+* Release for Spark 3.4.1 and up - the first version with support for Spark 3
+* Data throughput boost to 10..20M byte/s per Greenplum segment
+* Sub-second latency in the micro-batch streaming mode 
+
 # 2.1.0 (2023-08-11)
 ### New Features
 * Spark Structured Streaming micro-batch mode support for read and write operations

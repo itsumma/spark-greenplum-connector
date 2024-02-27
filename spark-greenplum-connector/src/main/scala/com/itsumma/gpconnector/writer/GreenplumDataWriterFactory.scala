@@ -1,24 +1,28 @@
 package com.itsumma.gpconnector.writer
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.itsumma.gpconnector.{GPOptionsFactory, SparkSchemaUtil}
-import org.apache.spark.sql.sources.v2.writer.{DataWriter, DataWriterFactory}
+import org.apache.spark.sql.connector.write.streaming.StreamingDataWriterFactory
+import org.apache.spark.sql.connector.write.{DataWriter, DataWriterFactory}
+import org.apache.spark.sql.itsumma.gpconnector.GPOptionsFactory
 import org.apache.spark.sql.types.StructType
-
 /*
-case class GreenplumDataWriterInstanceInfo(writeUUID: String, partInstanceId: String,
-                                           partitionId: Int, taskId: Long, epochId: Long,
-                                           writerInstance: GreenplumDataWriter)
-{}
+import com.typesafe.scalalogging.Logger
+import org.slf4j.LoggerFactory
 */
+
 
 class GreenplumDataWriterFactory(writeUUID: String, schema: StructType,
                                  optionsFactory: GPOptionsFactory, rmiRegistryAddress: String)
- extends DataWriterFactory[InternalRow]
+ extends DataWriterFactory
+ with StreamingDataWriterFactory
 {
   //private val logger = Logger(LoggerFactory.getLogger(this.getClass))
 
-  override def createDataWriter(partitionId: Int, taskId: Long, epochId: Long): DataWriter[InternalRow] = {
-    new GreenplumDataWriter(writeUUID, schema, optionsFactory, rmiRegistryAddress, partitionId, taskId, epochId)
+  override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] = {
+    new GreenplumDataWriter(writeUUID, schema, optionsFactory, rmiRegistryAddress, partitionId, taskId)
+  }
+
+  override def createWriter(partitionId: Int, taskId: Long, epochId: Long): DataWriter[InternalRow] = {
+    new GreenplumDataWriter(writeUUID, schema, optionsFactory, rmiRegistryAddress, partitionId, taskId, Option(epochId))
   }
 }

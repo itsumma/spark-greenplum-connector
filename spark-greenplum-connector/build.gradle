@@ -6,7 +6,7 @@ plugins {
 }
 
 group 'com.itsumma'
-version '2.1.0'
+version '3.1.0'
 
 def generatedResources = "$buildDir/generated-resources/main"
 
@@ -26,7 +26,7 @@ dependencies {
 shadowJar {
     archiveBaseName.set('spark-greenplum-connector_2.11')
     archiveClassifier.set('')
-    archiveVersion.set('2.1')
+    archiveVersion.set('3.1')
     minimize{
         exclude(dependency('org.postgresql:.*:.*'))
     }

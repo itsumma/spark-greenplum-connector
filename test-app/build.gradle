@@ -6,7 +6,7 @@ plugins {
 }
 
 group 'com.itsumma'
-version '2.1.0'
+version '3.1.0'
 description = ''
 
 sourceSets {
@@ -25,10 +25,11 @@ repositories {
 }
 
 dependencies {
-    implementation group: 'org.apache.spark', name: 'spark-streaming-kafka-0-10_2.11', version:'2.4.7'
-    implementation group: 'org.apache.spark', name: 'spark-sql-kafka-0-10_2.11', version:'2.4.7'
+    implementation group: 'org.apache.spark', name: 'spark-streaming-kafka-0-10_2.12', version:'3.4.1'
+    implementation group: 'org.apache.spark', name: 'spark-sql-kafka-0-10_2.12', version:'3.4.1'
     implementation group: 'com.vividsolutions', name: 'jts', version:'1.13'
-    compileOnly group: 'org.apache.spark', name: 'spark-streaming_2.11', version:'2.4.7'
+    implementation group: 'com.typesafe.scala-logging', name: 'scala-logging_2.12', version:'3.8.0'
+    compileOnly group: 'org.apache.spark', name: 'spark-streaming_2.12', version:'3.4.1'
 }
 
 application {
@@ -36,9 +37,9 @@ application {
 }
 
 shadowJar {
-    archiveBaseName.set('test-app_2.11')
+    archiveBaseName.set('test-app_2.12')
     archiveClassifier.set('')
-    archiveVersion.set('2.1')
+    archiveVersion.set('3.1')
     minimize{
         exclude(dependency('org.postgresql:.*:.*'))
     }

@@ -1,13 +1,15 @@
 package com.itsumma.gpconnector.writer
 
 import com.itsumma.gpconnector.rmi.{NetUtils, RMISlave}
-import com.typesafe.scalalogging.Logger
-import org.apache.spark.SparkEnv
+import com.itsumma.gpconnector.utils.ProgressTracker
+import org.apache.spark.internal.Logging
+import org.apache.spark.{SparkEnv, TaskContext}
+//import org.apache.spark.sql.SaveMode
 import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.connector.write.{DataWriter, WriterCommitMessage}
 import org.apache.spark.sql.itsumma.gpconnector.{GPOptionsFactory, SparkSchemaUtil}
-import org.apache.spark.sql.sources.v2.writer.{DataWriter, WriterCommitMessage}
 import org.apache.spark.sql.types.StructType
-import org.slf4j.LoggerFactory
+
 import java.util.concurrent.atomic.AtomicLong
 import scala.language.postfixOps
 
@@ -16,15 +18,18 @@ final case class GreenplumConnectionExpired(private val message: String = "",
 
 case class GreenplumWriterCommitMessage(writeUUID : String, instanceId: String, gpfdistUrl: String,
                                         partitionId : Int, taskId : Long, epochId : Long,
-                                        nRowsWritten : Long, rmiPutMs: Long, rmiGetMs: Long)
+                                        nRowsWritten : Long, rmiPutMs: Long, rmiGetMs: Long,
+                                        nBytesWritten : Long, webTransferMs: Long
+                                       )
   extends WriterCommitMessage
 {}
 
 class GreenplumDataWriter(writeUUID: String, schema: StructType, optionsFactory: GPOptionsFactory, rmiRegistry: String,
-                          partitionId: Int, taskId: Long, epochId: Long)
-  extends DataWriter[InternalRow]
+                          partitionId: Int, taskId: Long, batchId: Option[Long] = None)
+  extends DataWriter[InternalRow] with Logging
 {
-  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
+  val epochId: Long = batchId.getOrElse(
+    Option(TaskContext.get().getLocalProperty("streaming.sql.batchId")).getOrElse("0").toLong)
   private val exId: String = SparkEnv.get.executorId
   private val (_, localIpAddress: String) = NetUtils().getLocalHostNameAndIp
     //InetAddress.getLocalHost.getHostAddress
@@ -37,24 +42,25 @@ class GreenplumDataWriter(writeUUID: String, schema: StructType, optionsFactory:
 
   private val instanceId: String = s"$partitionId:$taskId:$epochId"
   private var rmiSlave: RMISlave = null
+  private val progressTracker: ProgressTracker = new ProgressTracker()
 
   //init()
 
-  def init(): Unit = {
+  private def init(): Unit = {
     rmiSlave = new RMISlave(optionsFactory, rmiRegistry, writeUUID, false, exId, partitionId, taskId, epochId)
     serviceInstanceController = rmiSlave.segService
     gpfdistUrl = rmiSlave.gpfdistUrl
     if (serviceInstanceController) {
-      logger.debug(s" " +
+      logDebug(s" " +
         s"GPFDIST controller instance started with port ${rmiSlave.servicePort}, " +
         s"writeUUID=$writeUUID, exId=$exId, partNo=$partitionId, instanceId=$instanceId")
     } else {
-      logger.debug(s" partitionNo=${partitionId}(instanceId=$instanceId): " +
+      logDebug(s"partitionNo=${partitionId}(instanceId=$instanceId): " +
         s"Slave instance started at: writeUUID=${writeUUID}, nodeIp=${localIpAddress}, gpfUrl='${gpfdistUrl}', " +
         s"executor_id=${exId}")
     }
     try {
-      rmiSlave.getSegServiceProvider
+    rmiSlave.getSegServiceProvider
     } catch {
       case e: java.rmi.NoSuchObjectException =>
         throw GreenplumConnectionExpired(s"Database connection expired after ${optionsFactory.networkTimeout} ms of inactivity." +
@@ -67,8 +73,10 @@ class GreenplumDataWriter(writeUUID: String, schema: StructType, optionsFactory:
       if (rmiSlave == null)
         init()
     }
-    val txt = SparkSchemaUtil(optionsFactory.dbTimezone).internalRowToText(schema, t, fieldDelimiter)
-    //logger.debug(s" write numFields=${t.numFields}, row(${rowCount.get()})='${txt}'")
+    val txt = progressTracker.trackProgress("row2text") {
+      SparkSchemaUtil(optionsFactory.dbTimezone).internalRowToText(schema, t, fieldDelimiter)
+    }
+    //logDebug(s"write numFields=${t.numFields}, row(${rowCount.get()})='${txt}'")
     val writeStart: Long = System.currentTimeMillis()
     rmiSlave.write(txt + '\n')
     rmiPutMs.addAndGet(System.currentTimeMillis() - writeStart)
@@ -77,25 +85,39 @@ class GreenplumDataWriter(writeUUID: String, schema: StructType, optionsFactory:
 
   override def commit(): WriterCommitMessage = {
     var rmiGetMs: Long = 0
+    var webTransferMs: Long = 0
+    var nBytes: Long = 0
+    var gpfReport: String = ""
     val valid: Boolean = this.synchronized{
       rmiSlave != null
     }
     if (valid) {
       val maxWait = if (optionsFactory.gpfdistTimeout > 0) optionsFactory.gpfdistTimeout else optionsFactory.networkTimeout
       try {
-        rmiSlave.commit(rowCount.get(), maxWait) // Will block until GPFDIST transfer complete
+        progressTracker.trackProgress("commit") {
+          rmiSlave.commit(rowCount.get(), maxWait) // Will block until GPFDIST transfer complete
+        }
+        gpfReport = rmiSlave.gpfReport
       } finally {
-        rmiGetMs = rmiSlave.stop
+        webTransferMs = rmiSlave.transferMs
+        nBytes = rmiSlave.transferBytes
+        progressTracker.trackProgress("gpfStopMs") {
+          rmiGetMs = rmiSlave.stop
+        }
         rmiSlave = null
-      }
+        }
     }
     if (serviceInstanceController) {
-      logger.debug(s" Destroyed ${gpfdistUrl} by commit, " +
-        s"write rowCount=${rowCount.get().toString}, rmiPutMs=${rmiPutMs.get()}, rmiGetMs=${rmiGetMs}")
+      logInfo(s"Destroyed ${gpfdistUrl} by commit, epochId=${epochId} " +
+        s"write rowCount=${rowCount.get().toString}, rmiPutMs=${rmiPutMs.get()}, rmiGetMs=${rmiGetMs}\n" +
+        s"${progressTracker.reportTimeTaken()}\n" +
+        s"${gpfReport}")
     }
     val ret = GreenplumWriterCommitMessage(writeUUID=writeUUID, instanceId=instanceId, gpfdistUrl=gpfdistUrl,
       partitionId=partitionId, taskId=taskId, epochId=epochId,
-      nRowsWritten=rowCount.get(), rmiPutMs=rmiPutMs.get(), rmiGetMs=rmiGetMs)
+      nRowsWritten=rowCount.get(), rmiPutMs=rmiPutMs.get(), rmiGetMs=rmiGetMs,
+      nBytesWritten=nBytes, webTransferMs=webTransferMs
+    )
     rowCount.set(0)
     rmiPutMs.set(0)
     ret
@@ -107,16 +129,18 @@ class GreenplumDataWriter(writeUUID: String, schema: StructType, optionsFactory:
       rmiSlave != null
     }
     if (valid) {
-      try {
-        rmiSlave.abort(rowCount.get(), optionsFactory.networkTimeout)
-      } finally {
-        rmiGetMs = rmiSlave.stop
+    try {
+      rmiSlave.abort(rowCount.get(), optionsFactory.networkTimeout)
+    } finally {
+      rmiGetMs = rmiSlave.stop
         rmiSlave = null
       }
     }
     if (serviceInstanceController) {
-      logger.debug(s" Destroyed ${gpfdistUrl} by abort, " +
+      logDebug(s"Destroyed ${gpfdistUrl} by abort, " +
         s"write rowCount=${rowCount.get().toString}, rmiPutMs=${rmiPutMs.get()}, rmiGetMs=${rmiGetMs}")
     }
   }
+
+  override def close(): Unit = {}
 }

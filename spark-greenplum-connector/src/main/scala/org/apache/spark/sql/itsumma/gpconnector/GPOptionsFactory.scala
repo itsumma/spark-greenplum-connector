@@ -1,11 +1,10 @@
 package org.apache.spark.sql.itsumma.gpconnector
 
-import com.typesafe.scalalogging.Logger
-//import org.apache.spark.SparkException
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.SaveMode
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.execution.datasources.jdbc.JDBCOptions
 import org.apache.spark.util.Utils
-import org.slf4j.LoggerFactory
 
 case class GPTarget(tableOrQuery: String) {
 
@@ -72,9 +71,12 @@ case class GPTarget(tableOrQuery: String) {
  * @param params Map[String, String] - Note: in Spark 2.x.x DataSourceOptions option names
  *     are implicitly converted to the lower case
  */
-case class GPOptionsFactory(params: Map[String, String]) {
-  require(params.contains("url"))
-  require(params.contains("dbtable") || params.contains("sqltransfer"))
+case class GPOptionsFactory(params: Map[String, String])
+  extends Logging
+{
+  if (!params.contains("url")) throw new java.lang.IllegalArgumentException("Must specify Greenplum DB url option")
+  if (!params.contains("dbtable") && !params.contains("sqlTransfer"))
+    throw new java.lang.IllegalArgumentException("Must specify dbtable or sqlTransfer option")
   val gpfdistTimeout: Long = Utils.timeStringAsMs(params.getOrElse("server.timeout", "-1"))
   val tableOrQuery: String = params.getOrElse("dbtable", "").trim
   val driver: String = "org.postgresql.Driver"
@@ -86,9 +88,9 @@ case class GPOptionsFactory(params: Map[String, String]) {
   val truncate: Boolean = params.getOrElse("truncate", "false").toBoolean
   val distributedBy: String = params.getOrElse("distributedby", "").trim
   val partitionClause: String = params.getOrElse("partitionclause","").trim
-  val sqlTransfer: String = params.getOrElse("sqltransfer", "").trim
+  val sqlTransfer: String = params.getOrElse("sqlTransfer", "").trim
   val dbSchema: String = params.getOrElse("dbschema", null)
-  val bufferSize: Int = params.getOrElse("buffer.size", "20000").toInt
+  val bufferSize: Int = params.getOrElse("buffer.size", "1000000").toInt
 //  val heartbeatInterval: Long = Utils.timeStringAsMs(params.getOrElse("spark.executor.heartbeatinterval", "10s"))
 //  val fetchTimeout: Long = Utils.timeStringAsMs(params.getOrElse("spark.files.fetchtimeout", "60s"))
   val networkTimeout: Long = Utils.timeStringAsMs(params.getOrElse("network.timeout",
@@ -100,6 +102,14 @@ case class GPOptionsFactory(params: Map[String, String]) {
   val offsetRestoreSql: String = params.getOrElse("offset.select", "").trim
   val undoSideEffectsSQL: String = params.getOrElse("undo.side.effects.sql", "").trim
   val readStreamAutoCommit: Boolean = params.getOrElse("stream.read.autocommit", "true").toBoolean
+  val saveMode: SaveMode = params.getOrElse("mode", "append") match {
+    case "append" => SaveMode.Append
+    case "overwrite" => SaveMode.Overwrite
+    case "error" | "errorifexists" => SaveMode.ErrorIfExists
+    case "ignore" => SaveMode.Ignore
+    case _ => SaveMode.Append
+  }
+  val actionName: String = params.getOrElse("action.name", tableOrQuery).trim
 
   /**
    * Dump passed in parameters for debug purposes
@@ -114,7 +124,6 @@ case class GPOptionsFactory(params: Map[String, String]) {
     ret.toString()
   }
 
-  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
   def getJDBCOptions(tableName: String = tableOrQuery): JDBCOptions = {
     val excludeParams = Map(
       "driver" -> "",
@@ -147,7 +156,9 @@ case class GPOptionsFactory(params: Map[String, String]) {
       "offset.select" -> "",
       "undo.side.effects.sql" -> "",
       "applicationname" -> "", // Spark-2 case workaround
-      "ApplicationName" -> ""
+      "ApplicationName" -> "",
+      "mode" -> "",
+      "action.name" -> ""
     )
     val excludeNullValues: Map[String, String] = params.filter{case (k, v) => v == null}
     var amendParams: Map[String, String] = (params --excludeParams.keySet --excludeNullValues.keySet) ++ Map("driver" -> driver,
@@ -163,7 +174,7 @@ case class GPOptionsFactory(params: Map[String, String]) {
     }
     if (appId != "")
       amendParams = amendParams ++ Map("ApplicationName" -> appId)
-    logger.debug(s"${amendParams.mkString("\n{", "\n", "}")}")
+    logDebug(s"${amendParams.mkString("\n{", "\n", "}")}")
     new JDBCOptions(CaseInsensitiveMap(amendParams))
   }
 }

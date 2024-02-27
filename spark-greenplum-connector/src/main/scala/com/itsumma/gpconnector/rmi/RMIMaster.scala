@@ -2,10 +2,9 @@ package com.itsumma.gpconnector.rmi
 
 import com.itsumma.gpconnector.rmi.GPConnectorModes.GPConnectorMode
 import com.itsumma.gpconnector.rmi.RMIMaster.{clientSocketFactory, createRegistry, localHotName, localIpAddress, serverSocketFactory}
-import com.typesafe.scalalogging.Logger
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.itsumma.gpconnector.GPOptionsFactory
 import org.apache.spark.sql.itsumma.gpconnector.SparkSchemaUtil.guessMaxParallelTasks
-import org.slf4j.LoggerFactory
 
 import java.net.{InetAddress, ServerSocket, Socket}
 //import java.rmi.{Naming, RemoteException}
@@ -16,51 +15,61 @@ import scala.collection.mutable.{HashMap => MutableHashMap, Map => MutableMap}
 import scala.collection.immutable.{ListMap, Set}
 import scala.util.Random
 
+//import com.typesafe.scalalogging.Logger
+//import org.slf4j.LoggerFactory
+
 /**
  * Central store for metadata forming GP-segment related interconnect area
  * allowing Spark executor instances communicate data to each other.
  */
-@remote trait ITSIpcServer {
+@remote
+trait ITSIpcServer extends java.rmi.Remote {
   //def connect(client: ITSIpcClient): String
 
   /**
    * Unregisters colling executor from the interconnect facility.
-   * @param pcb: client's Partition Control Block
+   *
+   * @param pcb : client's Partition Control Block
    */
+  // @throws[java.rmi.RemoteException]
   def disconnect(pcb: PartitionControlBlock): Unit
 
   /**
    * List all clients participating in the specified GP segment interconnect.
+   *
    * @param segmentId (String)
    * @return the set of corresponding client instances
    */
+  // @throws[java.rmi.RemoteException]
   def participantsList(segmentId: String): Set[ITSIpcClient]
 
   /**
    * Get ITSIpcClient instance where gpfdist service for the specified GP segment is running.
+   *
    * @param segmentId (String)
    * @return corresponding client instance
    */
+  // @throws[java.rmi.RemoteException]
   def getSegServiceProvider(segmentId: String): ITSIpcClient
 }
 
 /**
  * Provides RMI entry point for partition handlers
  */
-@remote trait TaskCoordinator {
+@remote
+trait TaskCoordinator extends java.rmi.Remote {
+  // @throws(classOf[java.rmi.RemoteException])
   def handlerAsks(pcb: PartitionControlBlock, func: String, msMax: Long = 60000): PartitionControlBlock
 }
 
 case class ServerSocketFactory(address: InetAddress)
-  extends RMIServerSocketFactory
-{
+  extends RMIServerSocketFactory {
   override def createServerSocket(port: Int): ServerSocket = new ServerSocket(port, 0, address)
 }
 
-case class ClientSocketFactory(address: InetAddress) extends RMIClientSocketFactory {
+case class ClientSocketFactory(address: InetAddress) extends RMIClientSocketFactory with Logging {
   override def createSocket(host: String, port: Int): Socket = {
-    val logger = Logger(LoggerFactory.getLogger(this.getClass))
-    logger.info(s"Passed in host is ${host}, actually using ${address.getHostName}/${address.getHostAddress}")
+    logInfo(s"Passed in host is ${host}, actually using ${address.getHostName}/${address.getHostAddress}")
     new Socket(address, port)
   }
 }
@@ -72,11 +81,12 @@ object GPConnectorModes extends Enumeration {
 
 object RMIMaster {
   val (localHotName: String, localIpAddress: String) = NetUtils().getLocalHostNameAndIp
-    //InetAddress.getLocalHost.getHostAddress
+  //InetAddress.getLocalHost.getHostAddress
   private val inetAddress: InetAddress = InetAddress.getByName(
-      InetAddress.getByName(NetUtils().resolveHost2Ip(localIpAddress)).getHostName)
+    InetAddress.getByName(NetUtils().resolveHost2Ip(localIpAddress)).getHostName)
   val serverSocketFactory: ServerSocketFactory = ServerSocketFactory(inetAddress)
   val clientSocketFactory: ClientSocketFactory = ClientSocketFactory(inetAddress)
+
   def createRegistry: (Registry, Int) = {
     var registry: Registry = null
     var registryPort: Int = -1
@@ -102,18 +112,19 @@ object RMIMaster {
 /**
  * Implements {@link ITSIpcServer} and {@link TaskCoordinator} RMI interfaces.
  * <p>Creates RMI registry instance bound to the random anonymous TCP port.
- * @param optionsFactory GPOptionsFactory instance
- * @param queryId String UUID
- * @param nGpSegments number of segments in the GP database we expect to serve
- * @param jobDone reference to atomic boolean where we return or get Done condition
- * @param jobAbort reference to atomic boolean where we return Abort condition
+ *
+ * @param optionsFactory  GPOptionsFactory instance
+ * @param queryId         String UUID
+ * @param nGpSegments     number of segments in the GP database we expect to serve
+ * @param jobDone         reference to atomic boolean where we return or get Done condition
+ * @param jobAbort        reference to atomic boolean where we return Abort condition
  * @param address2PrefSeg preferred set of served GP segments for every executor IP
  */
 class RMIMaster(optionsFactory: GPOptionsFactory,
                 queryId: String,
                 var nGpSegments: Int,
                 jobDone: AtomicBoolean, jobAbort: AtomicBoolean,
-                address2PrefSeg: Map[String, Set[String]] = Map[String, Set[String]](),
+                var address2PrefSeg: Map[String, Set[String]] = Map[String, Set[String]](),
                 mode: GPConnectorMode = GPConnectorModes.Batch,
                 isReadTransaction: Boolean = true
                )
@@ -121,8 +132,8 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     with ITSIpcServer
     with TaskCoordinator
     with Unreferenced
+    with Logging
 {
-  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
   private val nParallelTasks = guessMaxParallelTasks()
   private val client2Segment: MutableMap[ITSIpcClient, String] = MutableMap[ITSIpcClient, String]()
   private val address2Seg = MutableMap[String, Set[String]]()
@@ -132,6 +143,7 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
   private val nBatchSize = new AtomicInteger(0)
   private val nFails = new AtomicInteger(0)
   private val nSuccess = new AtomicInteger(0)
+  private val nSuccessBatch = new AtomicInteger(0)
   private val nSuccessTotal = new AtomicInteger(0)
   private var abortMsg: String = null
   private val lockPass = new AtomicLong(0)
@@ -141,25 +153,25 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
   /** GPFDIST service URLs indexed by executor instance ID */
   private val partUrlByInstId: MutableHashMap[String, String] = MutableHashMap()
 
-  logger.info(s"Starting driver instance ${queryId} on ${localHotName}/${localIpAddress}," +
+  logInfo(s"Starting driver instance ${queryId} on ${localHotName}/${localIpAddress}," +
     s"parallel tasks=$nParallelTasks")
   // private val registry: Registry = LocateRegistry.createRegistry(RMIRegPort)
   // Naming.rebind(s"//localhost:${RMIRegPort}/com/itsumma/gpconnector/rmi/RMIMaster", this)
   private var (registry: Registry, registryPort: Int) = createRegistry
   private val bindString = s"com/itsumma/gpconnector/${queryId}"
   registry.rebind(bindString, this)
-  logger.info(s"RMI registry is listening on ${localIpAddress}:${registryPort}")
+  logInfo(s"RMI registry is listening on ${localIpAddress}:${registryPort}")
 
   def rmiRegistryAddress = s"${localIpAddress}:${registryPort}"
 
   def getCurrentEpoch: Long = lastEpoch.get()
 
   def partUrls: Set[String] = this.synchronized {
-    if (isReadTransaction /*TODO: can use pcbByInstanceId too*/) {
+    if (isReadTransaction /*TODO: can use pcbByInstanceId too*/ ) {
       partUrlByInstId.values.toSet
     } else {
       pcbByInstanceId.
-        map{case (_, pcb) => pcb.gpfdistUrl}.toSet
+        map { case (_, pcb) => pcb.gpfdistUrl }.toSet
     }
   }
 
@@ -176,7 +188,9 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     nSuccessTotal.get() + nFails.get()
   }
 
-  def successTasks: Int =nSuccessTotal.get()
+  def successTasks: Int = nSuccessTotal.get()
+
+  def successTasksBatch: Int = nSuccessBatch.get()
 
   def failedTasks: Int = nFails.get()
 
@@ -202,14 +216,14 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
       val minWait = if (partInitMs > 0) partInitMs else 1000
       if ((currentBatchSize < nGpSegments)
         && (((System.currentTimeMillis() - transactionStartMs) < (minWait * 2)) ||
-          (mode != GPConnectorModes.Batch) // wait for all scheduled partitions hardly while streaming, fail job if unmet
-          )
+        (mode != GPConnectorModes.Batch) // wait for all scheduled partitions hardly while streaming, fail job if unmet
+        )
       )
         return -2
     }
     if (isReadTransaction && (mode == GPConnectorModes.Batch))
       jobDone.set(true) // Prevent further partition handler registration
-    logger.info(
+    logInfo(
       s"""New batch: ${batchNo.get()},\n""" +
         s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", ",", "}")}\n""" +
         s"""address2Seg=${address2Seg.mkString("{", ",", "}")}\n""" +
@@ -223,20 +237,21 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     transactionStartMs = System.currentTimeMillis()
     val start = System.currentTimeMillis()
     val rnd = new scala.util.Random
+    logDebug(s"\nwaitBatch: allocating batch ${batchNo.get()}")
     var curBatchNo: Int = waitBatchTry()
     lockPass.set(0)
     while ((curBatchNo < -1) && !Thread.currentThread().isInterrupted && ((System.currentTimeMillis() - start) < msMax)) {
       if (lockPass.incrementAndGet() == 1) {
-        logger.debug(s"\nLock in waitBatch, nSuccess=${nSuccess.get()}, nFails=${nFails.get()}")
+        logDebug(s"\nLock in waitBatch, batch=${batchNo.get()}, nSuccess=${nSuccess.get()}, nFails=${nFails.get()}")
       }
       Thread.sleep(rnd.nextInt(100) + 1)
       curBatchNo = waitBatchTry()
     }
     if (curBatchNo == -2) {
       if (batchNo.get() == 0) {
-        logger.debug(s"\nTimeout elapsed while allocating batch ${batchNo.get()}")
+        logDebug(s"\nTimeout elapsed while allocating batch ${batchNo.get()}")
       } else {
-        // logger.error(s"\nTimeout elapsed while allocating batch ${batchNo.get()}")
+        // logError(s"\nTimeout elapsed while allocating batch ${batchNo.get()}")
         throw new Exception(s"Timeout elapsed while allocating batch ${batchNo.get()}\n" +
           s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", ",", "}")}\n""" +
           s"""address2Seg=${address2Seg.mkString("{", ",", "}")}\n""" +
@@ -244,37 +259,40 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
         )
       }
     } else {
-      logger.debug(s"\nwaitBatch success, localBatchNo=${curBatchNo}, batchSize=${currentBatchSize}")
+      logDebug(s"\nwaitBatch success, localBatchNo=${curBatchNo}, batchSize=${currentBatchSize}")
     }
     curBatchNo
   }
 
-  private def commitBatchTry(): Int = this.synchronized {
+  private def commitBatchTry(): Int = {
     if (jobDone.get() || jobAbort.get())
       return -1
     if (nFails.get() > 0)
       throw new Exception(s"Abort on ${abortMsg}")
     if ((currentBatchSize == 0) || (nSuccess.get() < currentBatchSize))
       return -2
-    if (isReadTransaction && (mode == GPConnectorModes.Batch))
-      jobDone.set(true)
-    logger.info(
-      s"""commitBatch success, batchNo=${batchNo.get()}, batchSize=${currentBatchSize}, nSuccess=${nSuccess.get()}\n""" +
-        s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", "\n", "}")}\n""" +
-        s"""address2Seg=${address2Seg.mkString("{", "\n", "}")}\n""" +
-        s"""pcbByInstanceId=${pcbByInstanceId.mkString("{", "\n", "}")}"""
-    )
-    pcbByInstanceId.clear()
-    partUrlByInstId.clear()
-    address2Seg.clear()
-    seg2ServiceProvider.clear()
-    client2Segment.clear()
-    nSuccess.set(0)
-    localBatchPrepared = false
-    //nFails.set(0)
-    nBatchSize.set(0)
-    if (batchNo.incrementAndGet() < 0)
-      batchNo.set(0)
+    this.synchronized {
+      if (isReadTransaction && (mode == GPConnectorModes.Batch))
+        jobDone.set(true)
+      logInfo(
+        s"""commitBatch success, batchNo=${batchNo.get()}, batchSize=${currentBatchSize}, nSuccess=${nSuccess.get()}\n""" +
+          s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", "\n", "}")}\n""" +
+          s"""address2Seg=${address2Seg.mkString("{", "\n", "}")}\n""" +
+          s"""pcbByInstanceId=${pcbByInstanceId.mkString("{", "\n", "}")}"""
+      )
+      pcbByInstanceId.clear()
+      partUrlByInstId.clear()
+      address2Seg.clear()
+      seg2ServiceProvider.clear()
+      client2Segment.clear()
+      nSuccessBatch.set(nSuccess.get())
+      nSuccess.set(0)
+      localBatchPrepared = false
+      //nFails.set(0)
+      nBatchSize.set(0)
+      if (batchNo.incrementAndGet() < 0)
+        batchNo.set(0)
+    }
     batchNo.get()
   }
 
@@ -282,22 +300,34 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     val start = System.currentTimeMillis()
     val rnd = new scala.util.Random
     this.synchronized {
-      if (!isReadTransaction || !jobAbort.get())
+//      if (!isReadTransaction || jobAbort.get()) {
+//      }
+      var cmd = "sqlTransferComplete"
+      if (jobAbort.get()) {
+        cmd = "sqlTransferAbort"
+      }
       pcbByInstanceId.foreach { instance => {
-        instance._2.handler.coordinatorAsks(instance._2, "sqlTransferComplete")
-      }}
+          logDebug(s"Sending ${cmd} to the slave ${instance._1}")
+          val pcb:  PartitionControlBlock = instance._2.handler.coordinatorAsks(instance._2, cmd)
+          if (pcb != null) {
+            logTrace(s"commitBatch: sent ${cmd} to partition reader instances ${instance._1}")
+          } else {
+            logTrace(s"commitBatch: can't send ${cmd} to partition reader instances ${instance._1}")
+          }
+        }
+      }
     }
     var newBatchNo: Int = commitBatchTry()
     lockPass.set(0)
     while ((newBatchNo < -1) && !Thread.currentThread().isInterrupted && ((System.currentTimeMillis() - start) < msMax)) {
       if (lockPass.incrementAndGet() == 1)
-        logger.debug(s"Lock in commitBatch, nSuccess=${nSuccess.get()}, nFails=${nFails.get()}")
-      Thread.sleep(rnd.nextInt(100) + 1)
+        logDebug(s"Lock in commitBatch, nSuccess=${nSuccess.get()}, nFails=${nFails.get()}")
+      Thread.sleep(rnd.nextInt(10) + 1)
       newBatchNo = commitBatchTry()
     }
     if (newBatchNo == -2)
       throw new Exception(s"Unable to commit batch ${batchNo.get()}")
-    //logger.debug(s"commitBatch success, newBatchNo=${newBatchNo}")
+    //logDebug(s"commitBatch success, newBatchNo=${newBatchNo}")
     newBatchNo
   }
 
@@ -311,23 +341,23 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     try {
       registry.unbind(bindString)
     } catch {
-      case e: Exception => logger.warn(s"${e.getClass.getCanonicalName}")
+      case e: Exception => logWarning(s"${e.getClass.getCanonicalName}")
     }
     val registryUnexport: Boolean =
       try {
         UnicastRemoteObject.unexportObject(registry, true)
       } catch {
-        case e: Exception => logger.warn(s"${e.getClass.getCanonicalName}")
+        case e: Exception => logWarning(s"${e.getClass.getCanonicalName}")
           false
       }
     val selfUnexport: Boolean =
       try {
         UnicastRemoteObject.unexportObject(this, true)
       } catch {
-        case e: Exception => logger.warn(s"${e.getClass.getCanonicalName}")
+        case e: Exception => logWarning(s"${e.getClass.getCanonicalName}")
           false
       }
-    logger.info(s"${queryId}: unexportObject(self)=${selfUnexport}, unexportObject(registry)=${registryUnexport}, " +
+    logInfo(s"${queryId}: unexportObject(self)=${selfUnexport}, unexportObject(registry)=${registryUnexport}, " +
       s"batchNo=${batchNo.get()}, nGpSegments=${nGpSegments}, " +
       s"successTasksBatch=${nSuccess.get()}, totalSuccessTasks=${nSuccessTotal.get()}, nFails=${nFails}, " +
       s"nPCBs=${pcbByInstanceId.size}")
@@ -393,10 +423,11 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
             ) {
               val msgErr = s"Unable to adhere to the GP segment " +
                 s"${instanceSegmentId} as it has no gpfdist host assigned. pcb=${newPcb}"
-              logger.error(s"""${msgErr},\n""" +
-                s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", "\n", "}")}\n""" +
-                s"""address2Seg=${address2Seg.mkString("{", "\n", "}")}\n""" +
-                s"""pcbByInstanceId=${pcbByInstanceId.mkString("{", "\n", "}")}"""
+              logError(
+                s"""${msgErr},\n""" +
+                  s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", "\n", "}")}\n""" +
+                  s"""address2Seg=${address2Seg.mkString("{", "\n", "}")}\n""" +
+                  s"""pcbByInstanceId=${pcbByInstanceId.mkString("{", "\n", "}")}"""
               )
               throw new GpSegmentAdhereException(msgErr)
             }
@@ -427,9 +458,9 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
           nSuccessTotal.incrementAndGet()
         } else {
           if (isReadTransaction)
-            logger.info(s"Commit from extra or outdated slave, pcb=${pcb}")
+            logInfo(s"Commit from extra or outdated slave, pcb=${pcb}")
           else
-            logger.error(s"Commit from extra or outdated slave, pcb=${pcb}")
+            logError(s"Commit from extra or outdated slave, pcb=${pcb}")
           newPcb = pcb.copy()
         }
         msg = s"Commit from ${newPcb}"
@@ -443,14 +474,15 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
       }
       case unknownFunc => throw new Exception(s"Unknown call: ${unknownFunc}")
     }
-    logger.debug(s"\n${(System.currentTimeMillis() % 1000).toString} handlerAsks: ${func}, ${msg}")
+    logDebug(s"\n${(System.currentTimeMillis() % 1000).toString} handlerAsks: ${func}, ${msg}")
     if ((nFails.get() > 0) && (func != "abort"))
       throw new Exception(s"Abort on ${func}: ${msg}")
     newPcb
   }
 
+  // @throws[java.rmi.RemoteException]
   override def participantsList(segmentId: String): Set[ITSIpcClient] = this.synchronized {
-    client2Segment.filter{t => t._2 == segmentId}.keySet.toSet
+    client2Segment.filter { t => t._2 == segmentId }.keySet.toSet
   }
 
   /**
@@ -459,7 +491,8 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
    * and registers it for the interconnect facility of its segment.
    * Clients running on the application driver (not serving any GP segment itself)
    * should not call this method.
-   * @param pcb: structure containing a client handle and other parameters
+   *
+   * @param pcb : structure containing a client handle and other parameters
    * @return GP segment ID as String
    */
   private def connect(pcb: PartitionControlBlock): String = {
@@ -470,7 +503,7 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     if ((segId != null) || client2Segment.contains(client))
       throw new Exception(s"Second attempt to connect ${pcb}")
     var segSet = address2Seg.getOrElse(hostAddress, Set[String]())
-    val segmentServiceCounts = client2Segment groupBy(_._2) mapValues(_.size)
+    val segmentServiceCounts = client2Segment groupBy (_._2) mapValues (_.size)
     var candidateSegments: Set[String] = Set[String]()
     if (isServiceHolder) {
       if ((address2PrefSeg != null) && address2PrefSeg.contains(hostAddress)) {
@@ -493,24 +526,24 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     val candidateSegmentsShuffle = Random.shuffle(candidateSegments.toSeq) // For the case of all the counts are equal
     val candidateUseCounts = (for (id <- candidateSegmentsShuffle)
       yield (id, segmentServiceCounts.getOrElse(id, 0))).toMap
-    val countsAsc = ListMap(candidateUseCounts.toSeq.sortBy(_._2):_*)
+    val countsAsc = ListMap(candidateUseCounts.toSeq.sortBy(_._2): _*)
     segId = countsAsc.head._1
 
-/*
-    if (segSet.nonEmpty) {
-      // If clients GPF host already has any GP segments to serve then choose one of them randomly
-      val arr = segSet.toArray
-      val ix = rnd.nextInt(arr.length)
-      segId = arr(ix)
-    } else {
-      // If clients GPF host doesn't yet serve any GP segment then assign him the least served one
-      val zeroCounts = (for (id <- 0 until nGpSegments) yield (id.toString, 0)).toMap
-      val notServedSegments = zeroCounts.filter(entry => !segmentServiceCounts.contains(entry._1))
-      val allCounts = segmentServiceCounts.++(notServedSegments)
-      val countsAsc = ListMap(allCounts.toSeq.sortBy(_._2):_*)
-      segId = countsAsc.head._1
-    }
-*/
+    /*
+        if (segSet.nonEmpty) {
+          // If clients GPF host already has any GP segments to serve then choose one of them randomly
+          val arr = segSet.toArray
+          val ix = rnd.nextInt(arr.length)
+          segId = arr(ix)
+        } else {
+          // If clients GPF host doesn't yet serve any GP segment then assign him the least served one
+          val zeroCounts = (for (id <- 0 until nGpSegments) yield (id.toString, 0)).toMap
+          val notServedSegments = zeroCounts.filter(entry => !segmentServiceCounts.contains(entry._1))
+          val allCounts = segmentServiceCounts.++(notServedSegments)
+          val countsAsc = ListMap(allCounts.toSeq.sortBy(_._2):_*)
+          segId = countsAsc.head._1
+        }
+    */
     if ((segId == null) || segId.isEmpty)
       throw new Exception(s"Unable to assign GP segment to the ITSIpcClient instance ${client}")
     if (isServiceHolder) {
@@ -538,16 +571,17 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
         address2Seg -= pcb.nodeIp
       }
     }
-    client2Segment -= client
+    //client2Segment -= client // make it remain here until the batch end
     pcbByInstanceId -= pcb.instanceId
     //participantsListUpdate()
-    logger.info(s"Batch ${batchNo.get()}: disconnected ${pcb}")
+    logInfo(s"Batch ${batchNo.get()}: disconnected ${pcb}")
   }
 
+  // @throws[java.rmi.RemoteException]
   override def getSegServiceProvider(segmentId: String): ITSIpcClient = this.synchronized {
     val ret: ITSIpcClient = seg2ServiceProvider.getOrElse(segmentId, null)
     if (ret == null)
-      logger.error(s"Unable to find GPFDIST service provider for GP segment ${segmentId},\n" +
+      logError(s"Unable to find GPFDIST service provider for GP segment ${segmentId},\n" +
         s"""seg2ServiceProvider.keySet=${seg2ServiceProvider.keySet.mkString("{", "\n", "}")}\n""" +
         s"""address2Seg=${address2Seg.mkString("{", "\n", "}")}\n""" +
         s"""pcbByInstanceId=${pcbByInstanceId.mkString("{", "\n", "}")}"""
@@ -556,6 +590,6 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
   }
 
   override def unreferenced(): Unit = {
-    logger.info(s"unreferenced called")
+    logInfo(s"unreferenced called")
   }
 }

@@ -1,58 +1,70 @@
 package com.itsumma.gpconnector.rmi
 
 import com.itsumma.gpconnector.GPClient
-import com.itsumma.gpconnector.gpfdist.WebServer
+import com.itsumma.gpconnector.gpfdist.{WebServer, WebServerMetrics}
 import com.itsumma.gpconnector.rmi.RMISlave.{clientSocketFactory, serverSocketFactory}
+import com.itsumma.gpconnector.utils.ProgressTracker
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.itsumma.gpconnector.GPOptionsFactory
 
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.util
+import java.util.concurrent.atomic.{AtomicInteger, AtomicLong}
 //import java.rmi.Naming
 import java.rmi.server.{UnicastRemoteObject, Unreferenced}
 import scala.collection.mutable.{Queue => MutableQueue, Set => MutableSet}
-import com.typesafe.scalalogging.Logger
 import org.apache.spark.TaskContext
-import org.slf4j.LoggerFactory
 
 import java.rmi.registry.{LocateRegistry, Registry}
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- *   Provides data exchange facility within its interconnect area which corresponds to
+ * Provides data exchange facility within its interconnect area which corresponds to
  * particular GP segment, so Spark executors serving this segment can communicate data
  * to each other. This is helpful in the situation when number of gpfdist service instances
  * is less then the number of Spark partitions scheduled.
- *   <p> Also provides data buffering capabilities.
- *   Communication is thread-safe.
+ * <p> Also provides data buffering capabilities.
+ * Communication is thread-safe.
  */
-@remote trait ITSIpcClient {
+@remote
+trait ITSIpcClient extends java.rmi.Remote {
   /**
    * UUID unique for this instance
+   *
    * @return String
    */
+  // @throws[java.rmi.RemoteException]
   def name: String
 
   /**
    * IP of this instance
+   *
    * @return
    */
+  // @throws[java.rmi.RemoteException]
   def hostAddress: String
 
   /**
    * GP segment served by this instance
+   *
    * @return
    */
+  // @throws[java.rmi.RemoteException]
   def segId: String
 
   /**
    * Does this instance hold a gpfdist service?
+   *
    * @return Boolean
    */
+  // @throws[java.rmi.RemoteException]
   def segService: Boolean
 
   /**
    * Called by ITSIpcServer implementation to communicate participant lists within segment.
+   *
    * @param participants Set[ITSIpcClient]
    */
   //def participantsListUpdate(participants: Set[ITSIpcClient]): Unit
@@ -62,43 +74,46 @@ import java.util.concurrent.atomic.AtomicBoolean
    */
 
   /**
-   * Retrieve a portion of data from the segment data stream, or null
-   * if the stream is terminated and there is no more data buffered.
-   * Blocks until data available.
-   * Throws exception if timeout elapsed.
-   * @param msMax Int maximum wait time in ms
-   * @return Array[Byte]
-   */
-  def get(msMax: Long = 60000): Array[Byte]
-
-  /**
    * Closes the segment data stream on behalf of sender.
    * When all senders close the stream, it is considered terminated.
+   *
    * @param sender ITSIpcClient
    * @return Boolean, true if the stream is terminated
    */
+  // @throws[java.rmi.RemoteException]
   def close(sender: ITSIpcClient): Boolean
 
   /**
    * Registers the sender for this instance data stream and put data into the buffer.
    * The stream is considered open when at least one sender is registered.
+   *
    * @param sender ITSIpcClient
-   * @param data String
+   * @param data   String
    * @return true
    */
+  // @throws[java.rmi.RemoteException]
   def put(sender: ITSIpcClient, data: Array[Byte]): Boolean
 
   /**
+   * Flush the output buffer on this target.
+   */
+  def flush(): Unit
+
+  /**
    * Number of characters left in the buffer.
+   *
    * @return Int
    */
+  // @throws[java.rmi.RemoteException]
   def size: Int
 }
 
 /**
  * Provides RMI interface for transaction coordinator to gain this instance control
  */
-@remote trait TaskHandler {
+@remote
+trait TaskHandler extends java.rmi.Remote {
+  // @throws[java.rmi.RemoteException]
   def coordinatorAsks(pcb: PartitionControlBlock, func: String, msMax: Long = 60000): PartitionControlBlock
 }
 
@@ -113,14 +128,15 @@ object RMISlave {
 
 /**
  * Implements {@link ITSIpcClient} and {@link TaskHandler} RMI interfaces.
+ *
  * @param optionsFactory GPOptionsFactory instance
- * @param serverAddress String in the form IP:port of the RMI registry instance
- * @param queryId String UUID
- * @param readOrWrite Boolean - true for read, false for write transaction
- * @param executorId String from SparkEnv.get.executorId
- * @param partitionId Int as passed to DataWriter/DataReader interfaces
- * @param taskId Int as passed to DataWriter/DataReader interfaces
- * @param epochId Int as passed to DataWriter/DataReader interfaces
+ * @param serverAddress  String in the form IP:port of the RMI registry instance
+ * @param queryId        String UUID
+ * @param readOrWrite    Boolean - true for read, false for write transaction
+ * @param executorId     String from SparkEnv.get.executorId
+ * @param partitionId    Int as passed to DataWriter/DataReader interfaces
+ * @param taskId         Int as passed to DataWriter/DataReader interfaces
+ * @param epochId        Int as passed to DataWriter/DataReader interfaces
  */
 class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId: String,
                readOrWrite: Boolean,
@@ -129,23 +145,24 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
     with ITSIpcClient
     with TaskHandler
     with Unreferenced
+    with Logging
 {
-  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
+  private val progressTracker: ProgressTracker = new ProgressTracker()
   private val streamingBatchId = TaskContext.get.getLocalProperty("streaming.sql.batchId")
   private val isContinuousProcessing = TaskContext.get.getLocalProperty("__is_continuous_processing")
   private val instanceId: String = s"$partitionId:$taskId:$epochId"
   private val writerReady = new AtomicBoolean(readOrWrite)
   private val (instanceHostName: String, instanceHostAddress: String) = NetUtils().getLocalHostNameAndIp
-    //InetAddress.getLocalHost.getHostAddress
+  //InetAddress.getLocalHost.getHostAddress
   // private val instanceId = UUID.randomUUID.toString
-  logger.info(s"Starting executor instance for ${if (readOrWrite) "read" else "write"} " +
+  logInfo(s"Starting executor instance for ${if (readOrWrite) "read" else "write"} " +
     s"${queryId}/${instanceId}/${executorId} on ${instanceHostName}/${instanceHostAddress}" +
     s", server=${serverAddress}, streamingBatchId=$streamingBatchId, isContinuousProcessing=$isContinuousProcessing")
   var server: ITSIpcServer = try {
     //Naming..lookup(s"rmi://${serverAddress}/com/itsumma/gpconnector/rmi/RMIMaster") match {
     val registry: Registry = LocateRegistry.getRegistry(serverAddress.split(":")(0), serverAddress.split(":")(1).toInt)
     registry.lookup(s"com/itsumma/gpconnector/${queryId}") match {
-      case server: ITSIpcServer => server.asInstanceOf[ITSIpcServer]
+      case server: ITSIpcServer => server
       case server: TaskCoordinator => server.asInstanceOf[ITSIpcServer]
       case wrong => throw new Exception(s"Unknown remote class ${wrong.getClass.getCanonicalName}")
     }
@@ -155,27 +172,31 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
         s"${e.getClass.getCanonicalName} " +
         s"${e.getMessage}"
       if (!readOrWrite) {
-        logger.error(msg)
+        logError(msg)
         throw e
       }
-      logger.info(msg)
+      logInfo(msg)
       null
   }
   // private var partList: Set[ITSIpcClient] = Set[ITSIpcClient]() //server.participantsList(instanceSegmentId)
-  //private val dataQueue: MutableQueue[String] = MutableQueue[String]()
-  private var dataQueue: ByteBuffer = ByteBuffer.allocate(10000000)
-  private val bufferSize = optionsFactory.bufferSize
-  private var localWriteBuffer: ByteBuffer = ByteBuffer.allocate(bufferSize)
+  private val localWriteBufferGuard: Boolean = false
+  private var buffExchange: BufferExchange = new BufferExchange(optionsFactory.bufferSize)
   private val dataProviders: MutableSet[ITSIpcClient] = MutableSet[ITSIpcClient]()
-  private var nDataProvidersLeft: Int = 0
+  private val transactionStarted: LocalEvent = new LocalEvent(true, name = "trnStart")
+  private val providersDisconnected: LocalEvent = new LocalEvent(true, "srcDone")
+  private val nSourcesPlan: AtomicInteger = new AtomicInteger(0)
+  private val nSourcesDone: AtomicInteger = new AtomicInteger(0)
   var connected: Boolean = false
   private var instanceSegmentId: String = null
   private var isServiceProvider: Boolean = false
   private var pcb = PartitionControlBlock(this.asInstanceOf[TaskHandler], queryId, partitionId, instanceId,
     instanceHostAddress, if (readOrWrite) "R" else "W", executorId)
+  private val webServerMetrics: WebServerMetrics = new WebServerMetrics()
   private var webServer: WebServer = null
   var gpfdistUrl: String = null
-  var sqlTransferComplete: AtomicBoolean = new AtomicBoolean(false)
+  private val coordinatorSqlComplete: AtomicBoolean = new AtomicBoolean(false)
+  private val atLeastOnePostComplete: AtomicBoolean = new AtomicBoolean(false)
+  val sqlTransferComplete: AtomicBoolean = new AtomicBoolean(false)
   val jobAbort: AtomicBoolean = new AtomicBoolean(false)
 
   try {
@@ -190,7 +211,25 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
       sqlTransferComplete.set(true)
     }
   } catch {
-    case ex: java.rmi.NoSuchObjectException => logger.debug(s"${ex.getClass.getName} ${ex.getMessage}")
+    case ex: java.rmi.NoSuchObjectException => logDebug(s"${ex.getClass.getName} ${ex.getMessage}")
+  }
+
+  def webLoopMs: Long = {
+    webServerMetrics.webLoopMs.get()
+  }
+
+  def transferBytes: Long = {
+    webServerMetrics.totalBytes.get()
+  }
+
+  def transferMs: Long = {
+    webServerMetrics.processingMs.get()
+  }
+
+  def gpfReport: String = {
+    if (webServer == null)
+      return ""
+    webServer.progressTracker.reportTimeTaken()
   }
 
   def servicePort: Int = this.synchronized {
@@ -199,6 +238,7 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
     webServer.httpPort
   }
 
+  // @throws[java.rmi.RemoteException]
   override def coordinatorAsks(pcb: PartitionControlBlock, func: String, msMax: Long): PartitionControlBlock = {
     val start = System.currentTimeMillis()
     val rnd = new scala.util.Random
@@ -216,14 +256,14 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
     retPcb
   }
 
-  def coordinatorAsksTry(newPcb: PartitionControlBlock, func: String): PartitionControlBlock = this.synchronized {
+  private def coordinatorAsksTry(newPcb: PartitionControlBlock, func: String): PartitionControlBlock = this.synchronized {
     var retPcb: PartitionControlBlock = null
     var msg: String = ""
     func match {
       case "startService" => {
         isServiceProvider = true
         var port = optionsFactory.serverPort // By default port == 0 and WebServer assigns some available
-        webServer = new WebServer(port, this, jobAbort, sqlTransferComplete)
+        webServer = new WebServer(port, this, jobAbort, atLeastOnePostComplete, webServerMetrics)
         port = webServer.httpPort
         if (port == 0)
           throw new Exception(s"webServer.httpPort returns 0")
@@ -232,39 +272,53 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
         msg = s"GPFDIST service started at ${retPcb}"
       }
       case "sqlTransferComplete" => {
-        sqlTransferComplete.set(true)
+        if (isServiceProvider && readOrWrite) {
+          flush()
+        }
+        if (!readOrWrite) {
+          sqlTransferComplete.set(true)
+        } else {
+          coordinatorSqlComplete.set(true)
+        }
+        retPcb = newPcb.copy()
+        msg = s"${retPcb}"
+      }
+      case "sqlTransferAbort" => {
+        jobAbort.set(true)
+        coordinatorSqlComplete.set(true)
         retPcb = newPcb.copy()
         msg = s"${retPcb}"
       }
       case unknownFunc => throw new Exception(s"Unknown call: ${unknownFunc}")
     }
-    logger.info(s"\ncoordinatorAsks: ${func}, ${msg}")
+    logInfo(s"\ncoordinatorAsks: ${func}, ${msg}")
     retPcb
   }
 
-  private var callNo: Long = 0
+  private val firstRow: AtomicBoolean = new AtomicBoolean(true)
   private val rmiDataTargetGuard: Boolean = false
   private var rmiDataTarget: ITSIpcClient = null
+  private var rmiDataTargetInstId: String = null
   private var rmiThis: ITSIpcClient = this.asInstanceOf[ITSIpcClient]
 
-  def write(dataBytes: Array[Byte]): Unit = localWriteBuffer.synchronized {
-    callNo += 1
-    if (localWriteBuffer.capacity() < dataBytes.length) {
-      /*
-            throw new Exception(s"Row size exceeds buffer size of ${bufferSize} bytes. " +
-              s"Increase buffer.size connector parameter to at least ${dataBytes.length}.")
-      */
-      flushInternal()
-      localWriteBuffer = ByteBuffer.allocate(dataBytes.length)
+  def write(dataBytes: Array[Byte]): Unit = {
+    logTrace(s"write enter, length=${dataBytes.length}")
+    localWriteBufferGuard.synchronized {
+      putLocal(rmiThis, dataBytes)
+      if (firstRow.get()) {
+        if (readOrWrite) { ///TODO: for read only?
+          buffExchange.flush()
+        } else {
+          transactionStarted.reset()
+        }
+        firstRow.set(false)
+      } else {
+        if (buffExchange.available > 0) {
+          toRmiTarget()
+        }
+      }
     }
-    if (callNo == 1) {
-      localWriteBuffer.put(dataBytes)
-      flushInternal()
-    } else {
-      if (localWriteBuffer.remaining() < dataBytes.length)
-        flushInternal()
-      localWriteBuffer.put(dataBytes)
-    }
+    logTrace("write exit")
   }
 
   def write(data: String): Unit = {
@@ -272,52 +326,83 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
     write(dataBytes)
   }
 
-  def flush(): Unit = localWriteBuffer.synchronized {
-    flushInternal()
+  override def flush(): Unit = localWriteBufferGuard.synchronized {
+    buffExchange.flush()
+    toRmiTarget()
   }
 
-  private def flushInternal(): Unit = {
-    localWriteBuffer.flip()
-    if (localWriteBuffer.remaining() > 0) {
-      val dataBytes = new Array[Byte](localWriteBuffer.remaining())
-      localWriteBuffer.get(dataBytes)
-      //val data = new String(dataBytes, StandardCharsets.UTF_8)
+  private def toRmiTarget(): Unit = {
+    val available = buffExchange.available
+    logTrace(s"toRmiTarget enter, instanceId=${instanceId} available=${available}")
+    if (available > 0) {
       if (!jobAbort.get()) {
         rmiDataTargetGuard.synchronized {
-          if (rmiDataTarget == null)
-            rmiDataTarget = getSegServiceProvider
-          if (rmiThis == rmiDataTarget) {
-            putLocal(this.asInstanceOf[ITSIpcClient], dataBytes)
-          } else {
-            rmiDataTarget.put(this.asInstanceOf[ITSIpcClient], dataBytes)
+          if (rmiDataTarget == null) throw new Exception("Call rmiSlave.getSegServiceProvider method somewhere")
+            //rmiDataTarget = getSegServiceProvider
+          if (instanceId != rmiDataTargetInstId) {
+          //if (rmiThis != rmiDataTarget) {
+            var buff = buffExchange.get()
+            while (buff != null) {
+              if (buff.position() > 0)
+                rmiDataTarget.put(this.asInstanceOf[ITSIpcClient], util.Arrays.copyOfRange(buff.array(), 0, buff.position()))
+              buffExchange.addBuffer(buff)
+              buff = buffExchange.get()
+            }
+            rmiDataTarget.flush()
           }
+        }
+      } else {
+        buffExchange.clear()
+      }
+    }
+    logTrace(s"toRmiTarget exit, instanceId=${instanceId}")
+  }
+
+  def commit(rowCount: Long, msMax: Long = 60000): Unit = {
+    logTrace(s"commit enter, instanceId=${instanceId}")
+    var closed: Boolean = false
+    if (!connected) {
+      logDebug(s"Commit called, but client has never been connected")
+      return
+    }
+    if (!readOrWrite) {
+      if (isServiceProvider) {
+        rmiDataTargetGuard.synchronized {
+          closed = close(this.asInstanceOf[ITSIpcClient])
+        }
+        if (!transactionStarted.waitForEvent(msMax) || !providersDisconnected.waitForEvent(msMax)) {
+          jobAbort.set(true)
+          throw new Exception(s"Time limit elapsed (${msMax}) waiting uplink data end for instanceId=${instanceId}")
         }
       }
     }
-    localWriteBuffer.clear()
-  }
-
-  def commit(rowCount: Long, msMax: Long = 60000): Unit = localWriteBuffer.synchronized {
-    if (!connected) {
-      logger.debug(s"Commit called, but client has never been connected")
-      return
+    if (!NetUtils().waitForCompletion(msMax) {
+      if (buffExchange.available == 0)
+        flush()
+      buffExchange.totalDrain.get() == buffExchange.totalFill.get()
+    }) {
+      jobAbort.set(true)
+      throw new Exception(s"Buffer transfer incomplete for instanceId=${instanceId}: " +
+        s"fillBytes=${buffExchange.totalFill.get()}, drainBytes=${buffExchange.totalDrain.get()}")
     }
-    writerReady.set(true)
     pcb = pcb.copy(rowCount = rowCount)
-    logger.info(s"Calling commit on ${pcb}")
+    logInfo(s"Calling commit on ${pcb}")
     try {
       pcb = server.asInstanceOf[TaskCoordinator].handlerAsks(pcb, "commit", msMax)
     } catch {
       case e: java.rmi.NoSuchObjectException =>
-        logger.info(s"handlerAsks('commit',pcb) called with server that is already shut down: pcb=${pcb}")
+        logInfo(s"handlerAsks('commit',pcb) called with server that is already shut down: pcb=${pcb}")
     }
-    flushInternal()
-    val closed: Boolean = if (rmiDataTarget != null) {
-      rmiDataTarget.close(this.asInstanceOf[ITSIpcClient])
-    } else false
+    writerReady.set(true)
+    rmiDataTargetGuard.synchronized {
+      closed = if ((rmiDataTarget != null) && (rmiDataTarget != rmiThis)) {
+        rmiDataTarget.close(this.asInstanceOf[ITSIpcClient])
+      } else closed //close(this.asInstanceOf[ITSIpcClient])
+    }
     if (!closed)
-      logger.debug(s"rmiDataTarget.close = false, ${pcb}")
+      logDebug(s"rmiDataTarget.close = false, ${pcb}")
     // Locks until GPFDIST transfer complete
+    logTrace(s"commit: sqlTransferComplete=${sqlTransferComplete.get()}")
     if (!NetUtils().waitForCompletion(msMax) {
       sqlTransferComplete.get()
     })
@@ -325,180 +410,260 @@ class RMISlave(optionsFactory: GPOptionsFactory, serverAddress: String, queryId:
     rmiDataTargetGuard.synchronized {
       rmiDataTarget = null
     }
+    rmiThis = null
+    buffExchange.clear()
+    buffExchange = null
+    logTrace(s"commit exit, instanceId=${instanceId}")
   }
 
   def abort(rowCount: Long, msMax: Long = 60000): Unit = { //localWriteBuffer.synchronized {
+    logTrace(s"commit abort, instanceId=${instanceId}")
     if (!connected) {
-      logger.debug(s"Abort called, but client has never been connected")
+      logDebug(s"Abort called, but client has never been connected")
       return
     }
     pcb = pcb.copy(rowCount = rowCount)
     try {
       pcb = server.asInstanceOf[TaskCoordinator].handlerAsks(pcb, "abort")
     } catch {
-      case ex: java.rmi.NoSuchObjectException => logger.debug(s"${ex.getClass.getName} ${ex.getMessage}")
+      case ex: java.rmi.NoSuchObjectException => logDebug(s"${ex.getClass.getName} ${ex.getMessage}")
     }
     jobAbort.set(true)
-    val rnd = new scala.util.Random
-    val start = System.currentTimeMillis()
-    while (!sqlTransferComplete.get() && !Thread.currentThread().isInterrupted && ((System.currentTimeMillis() - start) < msMax)) {
-      Thread.sleep(rnd.nextInt(100) + 1)
+    NetUtils().waitForCompletion(msMax) {
+      sqlTransferComplete.get() || coordinatorSqlComplete.get()
     }
     rmiDataTargetGuard.synchronized {
-      if (rmiDataTarget != null) {
+      if ((rmiDataTarget != null) && (rmiDataTarget != rmiThis)) {
         rmiDataTarget.close(this.asInstanceOf[ITSIpcClient])
-        rmiDataTarget = null
+      } else {
+        close(this.asInstanceOf[ITSIpcClient])
       }
+      rmiDataTarget = null
     }
+    rmiThis = null
+    buffExchange.clear()
+    buffExchange = null
   }
 
   def stop: Long = this.synchronized {
     try {
       if (connected && server != null) {
-        server.disconnect(pcb)
+        progressTracker.trackProgress("rmiDisconnect") {
+          server.disconnect(pcb)
+        }
         connected = false
       }
     } catch {
       case e: java.rmi.NoSuchObjectException =>
-        logger.info(s"server.disconnect(pcb) called with server that is already shut down: pcb=${pcb}")
-      case e: Exception => logger.warn(s"server.disconnect(pcb) failed: pcb=${pcb}, ${e}")
+        logInfo(s"server.disconnect(pcb) called with server that is already shut down: pcb=${pcb}")
+      case e: Exception => logWarning(s"server.disconnect(pcb) failed: pcb=${pcb}, ${e}")
     }
     server = null
     rmiThis = null
     rmiDataTarget = null
     connected = false
     var rmiLoopMs: Long = 0
-    if (webServer != null) {
-      rmiLoopMs = webServer.rmiLoopMs.get()
-      //webServer.server.stop(1)
-      webServer.stop
-      webServer = null
-      logger.debug(s"Web server instance terminated (${gpfdistUrl})")
+    progressTracker.trackProgress("webServerStop") {
+      if (webServer != null) {
+        rmiLoopMs = webServerMetrics.rmiLoopMs.get()
+        //webServer.server.stop(1)
+        webServer.stop
+        webServer = null
+        logDebug(s"Web server instance terminated (${gpfdistUrl})")
+      }
     }
-    try {
-      val success = UnicastRemoteObject.unexportObject(this, true)
-      logger.info(s"unexportObject(pcb=${pcb})=${success}")
-    } catch {
-      case e: Exception => logger.warn(s"unexportObject failed: pcb=${pcb}, ${e.getClass.getCanonicalName}")
+    progressTracker.trackProgress("rmiUnexport") {
+      try {
+        val success = UnicastRemoteObject.unexportObject(this, true)
+        logInfo(s"unexportObject(pcb=${pcb})=${success}")
+      } catch {
+        case e: Exception => logWarning(s"unexportObject failed: pcb=${pcb}, ${e.getClass.getCanonicalName}")
+      }
     }
     dataProviders.clear()
+    logInfo(s"stop took: ${progressTracker.reportTimeTaken()}")
     rmiLoopMs
   }
 
+  // @throws[java.rmi.RemoteException]
   override def name: String = instanceId
 
+  // @throws[java.rmi.RemoteException]
   override def hostAddress: String = instanceHostAddress
 
+  // @throws[java.rmi.RemoteException]
   override def segId: String = instanceSegmentId
 
+  // @throws[java.rmi.RemoteException]
   override def segService: Boolean = isServiceProvider
 
-/*
-  override def participantsListUpdate(participants: Set[ITSIpcClient]): Unit = this.synchronized {
-    partList = participants
-  }
-*/
+  private var waitForPost: Long = 0L
+  private val getSucceededOnce: AtomicBoolean = new AtomicBoolean(false)
 
-  private var getSucceededOnce: Boolean = false
-
-  private def tryGet: Array[Byte] = this.synchronized {
-    var ret: Array[Byte] = null
-    if (dataQueue.position() > 0) {
-      dataQueue.flip()
-      ret = new Array[Byte](dataQueue.remaining())
-      dataQueue.get(ret)
-      dataQueue.clear()
-    }
-    if (!sqlTransferComplete.get()) {
-      if (ret == null) {
-        if (dataProviders.nonEmpty || (readOrWrite && connected && !getSucceededOnce) || !writerReady.get())
-          ret = new Array[Byte](0) // Will block
+  private def webTransferComplete: Boolean = {
+    if (!readOrWrite || (webServer == null)) return sqlTransferComplete.get()
+    if (readOrWrite && coordinatorSqlComplete.get() && !sqlTransferComplete.get()) {
+      if (atLeastOnePostComplete.get()) {
+        sqlTransferComplete.set(true)
+      } else {
+        if (waitForPost == 0) waitForPost = System.currentTimeMillis()
+        if (System.currentTimeMillis() - waitForPost > 2000) sqlTransferComplete.set(true)
       }
     }
-    if ((ret != null) && ret.nonEmpty && !getSucceededOnce) {
-      getSucceededOnce = true
-      logger.debug(s"getSucceededOnce=true pcb=${pcb}")
+    val ret = ((webServer.nSegInProgress == 0)
+      && sqlTransferComplete.get()
+      && (buffExchange.totalDrain.get() >= buffExchange.totalFill.get())
+      && (buffExchange.available == 0)
+      )
+    if (sqlTransferComplete.get() && (buffExchange.available != 0))
+      logDebug(s"webTransfer(${ret}): waiting for byte queue drain completion, ${buffExchange.available} bytes left..")
+    ret
+  }
+
+  private def tryGet(msMax: Long = 10): ByteBuffer = {
+    var ret: ByteBuffer = buffExchange.get(msMax)
+    if ((ret != null) && (ret.position() > 0) && !getSucceededOnce.get()) {
+      getSucceededOnce.set(true)
+      logDebug(s"getSucceededOnce=true pcb=${pcb}")
+    }
+    if (!readOrWrite || getSucceededOnce.get()) {
+      if (nSourcesPlan.get() == 0) providersDisconnected.reset()
+      transactionStarted.signalEvent()
+      if (!readOrWrite) {
+        if (nSourcesPlan.get() == 0) {
+          nSourcesPlan.set(server.participantsList(instanceSegmentId).size)
+        }
+        if ((nSourcesPlan.get() > 0) && (nSourcesDone.get() >= nSourcesPlan.get())) {
+          providersDisconnected.signalEvent()
+        }
+      }
+    }
+    this.synchronized {
+      if ((ret == null) && !webTransferComplete) {
+        if ((nSourcesPlan.get() > nSourcesDone.get())
+          || (readOrWrite && connected && (!getSucceededOnce.get() || dataProviders.nonEmpty))
+          || (buffExchange.totalDrain.get() < buffExchange.totalFill.get())
+          || !writerReady.get())
+          ret = ByteBuffer.allocate(0) // Will block
+      }
     }
     ret
   }
 
-  val getWillBlock: AtomicBoolean = new AtomicBoolean(false)
+  private val getWillBlock: AtomicBoolean = new AtomicBoolean(false)
 
-  override def get(msMax: Long = 60000): Array[Byte] = {
+
+  /**
+   * Retrieve a portion of data from the segment data stream, or null
+   * if the stream is terminated and there is no more data buffered.
+   * Blocks until data available.
+   * Throws exception if timeout elapsed.
+   *
+   * @param msMax Int maximum wait time in ms
+   * @return ByteBuffer
+   */
+  def read(msMax: Long = 60000): ByteBuffer = {
     val rnd = new scala.util.Random
     val start = System.currentTimeMillis()
-    var ret: Array[Byte] = tryGet
+    logTrace(s"read enter: threadId=${Thread.currentThread().getId}, instanceId=${instanceId}")
     getWillBlock.set(false)
+    var ret: ByteBuffer = tryGet(rnd.nextInt(10) + 1)
     while (!Thread.currentThread().isInterrupted
+      && !jobAbort.get()
       && ((msMax < 0) || (System.currentTimeMillis() - start) < msMax)
-      && (ret != null) && ret.isEmpty) {
+      && (ret != null) && (ret.position() == 0)) {
       if (!getWillBlock.get()) {
         getWillBlock.set(true)
-        logger.debug(s"Get will block, instanceSegmentId=${instanceSegmentId}")
+        logDebug(s"Get will block, threadId=${Thread.currentThread().getId}, instanceId=${instanceId}")
       }
-      Thread.sleep(rnd.nextInt(10) + 1)
-      ret = tryGet
+      ret = tryGet(rnd.nextInt(10) + 1)
     }
-    if ((ret != null) && ret.isEmpty)
-      throw new Exception(s"Time limit elapsed (${msMax}) waiting data from instanceId=${instanceId}")
+    if (!jobAbort.get() && sqlTransferComplete.get() && (ret == null)) ret = tryGet(1)
+    if (ret != null) {
+      if (ret.position() == 0)
+        throw new Exception(s"Time limit elapsed (${msMax}) " +
+          s"waiting data from threadId=${Thread.currentThread().getId}, instanceId=${instanceId}")
+      logTrace(s"read success: threadId=${Thread.currentThread().getId}, " +
+        s"instanceId=${instanceId}, nBytes=${ret.position()}")
+    } else {
+      logDebug(s"End of stream: threadId=${Thread.currentThread().getId}, instanceId=${instanceId}")
+    }
     ret
   }
 
+  def recycleBuffer(buff: ByteBuffer): Unit = {
+    buffExchange.addBuffer(buff)
+  }
+
+  // @throws[java.rmi.RemoteException]
   override def close(sender: ITSIpcClient): Boolean = this.synchronized {
     var ret: Boolean = false
-    if (dataProviders.contains(sender))
+    logTrace(s"close() enter: sources plan ${nSourcesPlan.get()}, done ${nSourcesDone.get()}, " +
+      s"\nthis ${rmiThis}," +
+      s"\narg provider=${sender}," +
+      s"\nlist (size ${dataProviders.size})")
+    if (dataProviders.contains(sender)) {
       dataProviders -= sender
-    if (dataProviders.isEmpty && (dataQueue.position() == 0)) {
-      // if (sender == this.asInstanceOf[ITSIpcClient]) {
-      if (sender.segService) {
-        if (nDataProvidersLeft <= 1) {
-          ret = true
-          nDataProvidersLeft = 0
-        }
-      } else {
-        ret = true
-        nDataProvidersLeft -= 1
-      }
+      //      if (sender != rmiThis) {
+      nSourcesDone.incrementAndGet()
+      //      }
+      ret = true
+    }
+    logTrace(s"close() exit: sources plan ${nSourcesPlan.get()}, done ${nSourcesDone.get()}, " +
+      s"list (size ${dataProviders.size}):\n${dataProviders}")
+    //if ((nSourcesPlan.get() > 0) && (nSourcesDone.get() >= nSourcesPlan.get() - 1)) {
+    if ((nSourcesPlan.get() > 0) && (nSourcesDone.get() >= nSourcesPlan.get())) {
+      // Ourself local provider should be the one that remains
+      providersDisconnected.signalEvent()
+      //if (ret) rmiDataTarget = null
     }
     ret
   }
 
+  // @throws[java.rmi.RemoteException]
   override def put(sender: ITSIpcClient, data: Array[Byte]): Boolean = {
     putLocal(sender, data)
   }
 
   private def putLocal(sender: ITSIpcClient, data: Array[Byte]): Boolean = this.synchronized {
     if (!dataProviders.contains(sender)) {
+      logTrace(s"putLocal adding provider ${sender}")
       dataProviders += sender
-      nDataProvidersLeft += 1
+      if (rmiThis != sender) {
+        providersDisconnected.reset()
+      }
     }
-    if (dataQueue.remaining() < data.length) {
-      val newDataQueue = ByteBuffer.allocate(dataQueue.position() + data.length)
-      newDataQueue.put(dataQueue.array(), 0, dataQueue.position())
-      dataQueue = newDataQueue
-    }
-    dataQueue.put(data)
+    buffExchange.put(data)
     writerReady.set(true)
     true
   }
 
+  // @throws[java.rmi.RemoteException]
   override def size: Int = this.synchronized {
-    dataQueue.position()
+    buffExchange.available.toInt
   }
 
   /**
    * Returns gpfdist instance holder serving this instance segment
+   *
    * @return ITSIpcClient
    */
   def getSegServiceProvider: ITSIpcClient = this.synchronized {
     rmiDataTargetGuard.synchronized {
       if (!connected) {
-        logger.debug(s"getSegServiceProvider called, but client has never been connected")
+        logDebug(s"getSegServiceProvider called, but client has never been connected")
         return null
       }
-      rmiDataTarget = server.getSegServiceProvider(instanceSegmentId)
+      if (rmiDataTarget == null) {
+        if (!isServiceProvider) {
+          rmiDataTarget = server.getSegServiceProvider(instanceSegmentId)
+        } else {
+          rmiDataTarget = rmiThis
+        }
+      }
       if (rmiDataTarget == null)
         throw new Exception(s"Unable to find GPFDIST service provider for GP segment ${instanceSegmentId}, pcb=${pcb}")
+      rmiDataTargetInstId = rmiDataTarget.name
       rmiDataTarget
     }
   }

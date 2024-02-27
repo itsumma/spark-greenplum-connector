@@ -27,7 +27,7 @@ This technique allows to delegate some part of data processing onto the DB side.
 
 ### How to use
 
-1. [Download](https://github.com/itsumma/spark-greenplum-connector/releases/download/v2.1.0/spark-greenplum-connector_2.11-2.1.jar) or build the library. See build instructions [here](BUILD.md).
+1. [Download](https://github.com/itsumma/spark-greenplum-connector/releases/download/v3.1.0/spark-greenplum-connector_2.12-3.1.jar) or build the library. See build instructions [here](BUILD.md).
 2. Copy jar-file to `/path/to/spark-greenplum-connector_x.x-x.x.jar`, replace /path/to with your Spark **jars** folder path
 3. Optionally, depending on your Spark installation, you may need to edit conf/spark-defaults.conf and place here:
 ```
@@ -131,3 +131,14 @@ See comments in the **examples/streaming-example.scala** file for more examples 
  `**`  Total row size including all fields up to 64k
  
  `***` PostGIS GEOMETRY. See http://postgis.net/workshops/postgis-intro/geometries.html
+
+### Performance
+
+- With short (few bytes in size) records - up to 100000 rows per second read or write throughput is achievable per Greenplum segment.
+- With large rows (10K bytes per record and more) - about 10..20 Mb per second read or write throughput is achievable per Greenplum segment.
+- Depending on the batch size, sub-second latency and micro-batch interval can be achieved in stream applications.
+
+### Known limitations
+
+- With write operations specifying mode("append") or mode("overwrite") explicitly is mandatory, otherwise "Operation is not supported" error will be thrown.
+- Number of executors available to the application must be not greater than the number of Greenplum primary segments. Look your cluster manager documentation on how to limit the number of executors.

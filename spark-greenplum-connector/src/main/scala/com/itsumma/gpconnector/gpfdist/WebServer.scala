@@ -1,16 +1,25 @@
 package com.itsumma.gpconnector.gpfdist
 
-import com.itsumma.gpconnector.rmi.{ITSIpcClient, RMISlave}
+import com.itsumma.gpconnector.rmi.RMISlave
+import com.itsumma.gpconnector.utils.ProgressTracker
 import com.sun.net.httpserver.{HttpExchange, HttpHandler, HttpServer}
-import com.typesafe.scalalogging.Logger
-import org.slf4j.LoggerFactory
+import org.apache.spark.internal.Logging
 
 import java.net.InetSocketAddress
-import java.nio.charset.StandardCharsets
+import java.util.concurrent.locks.ReentrantLock
+//import java.nio.charset.StandardCharsets
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}
-import scala.collection.mutable.{HashMap => MutableHashMap, Queue => MutableQueue, Set => MutableSet}
-import scala.collection.JavaConversions._
+import scala.collection.mutable
+import scala.collection.mutable.{HashMap => MutableHashMap}
+import scala.collection.JavaConverters._
+
+class WebServerMetrics {
+  val rmiLoopMs = new AtomicLong(0)
+  val webLoopMs = new AtomicLong(0)
+  val processingMs = new AtomicLong(0)
+  val totalBytes = new AtomicLong(0)
+}
 
 /**
  * Implements GPFDIST protocol natively in scala.
@@ -18,33 +27,41 @@ import scala.collection.JavaConversions._
  * @param port     TCP port number to bind the service
  * @param rmiSlave to communicate data with Spark
  */
-class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transferComplete: AtomicBoolean) {
+class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transferComplete: AtomicBoolean, metrics: WebServerMetrics)
+  extends Logging
+{
 
-  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
   private val executor = Executors.newFixedThreadPool(10)
   val server: HttpServer = HttpServer.create(new InetSocketAddress(port), 0)
 
   def httpPort: Int = server.getAddress.getPort
 
-  var rmiLoopMs = new AtomicLong(0)
+  val progressTracker: ProgressTracker = new ProgressTracker()
+  private val rmiLoopMs = metrics.webLoopMs
+  private val webLoopMs = metrics.webLoopMs
+  private val processingMs = metrics.processingMs
+  private val totalBytes = metrics.totalBytes
 
+  private val segmentCount: AtomicInteger = new AtomicInteger(0)
+  private val segmentDoneCount: AtomicInteger = new AtomicInteger(0)
+
+  def nSegInProgress: Int = segmentCount.get() - segmentDoneCount.get()
+
+  private val me = new ReentrantLock()
+
+  // Guarded vars:
   private val activeWriters = MutableHashMap[String, Int]()
   private val segmentQueues = MutableHashMap[String, Array[Byte]]()
-  private val segmentCount: AtomicInteger = new AtomicInteger(0)
-  private val allSegmentsDone: AtomicBoolean = new AtomicBoolean(false)
   private val segPass = MutableHashMap[String, Int]()
-
-  private val me = this
 
   if (!rmiSlave.segService)
     throw new Exception(s"WebServer instance holder should be marked as service provider in its segment")
 
-  def stop: Unit = me.synchronized {
-    server.stop(1)
+  def stop(): Unit = me.synchronized {
+    server.stop(0)
+    executor.shutdown()
     segmentQueues.clear()
     activeWriters.clear()
-    allSegmentsDone.set(true)
-    executor.shutdown()
   }
 
   server.createContext("/", new HttpHandler() {
@@ -63,73 +80,95 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
       val headers = exchange.getRequestHeaders
       val targetName = uri.getPath
       val method = exchange.getRequestMethod.toLowerCase
-      val segmentId = headers.get("X-gp-segment-id").toList match {
-        case values: List[String] => values.head
+      val segmentId = headers.get("X-gp-segment-id").asScala match {
+        case values: mutable.Buffer[String] => values.head
         case _ => throw new Exception(s"No X-GP-SEGMENT-ID")
       }
       var contentLength: Int = 0
       if (headers.containsKey("Content-length"))
-        contentLength = headers.get("Content-length").toList match {
-          case values: List[String] => values.head.toInt
+        contentLength = headers.get("Content-length").asScala match {
+          case values: mutable.Buffer[String] => values.head.toInt
           case _ => 100000
         }
-      logger.debug(s"Uri: ${uri.toString}, scheme: ${scheme}, method: ${method}, " +
+      logDebug(s"Uri: ${uri.toString}, scheme: ${scheme}, method: ${method}, " +
         s"caller: ${exchange.getRemoteAddress}, segmentId: ${segmentId}, contentLength=${contentLength}")
       if (method == "get") {
         val responseHeaders = exchange.getResponseHeaders
         responseHeaders.remove("Transfer-encoding")
-        responseHeaders.put("Content-type", List("text/plain"))
-        responseHeaders.put("Expires", List("0"))
-        responseHeaders.put("X-GPFDIST-VERSION", List("6.8.1 build commit:7118e8aca825b743dd9477d19406fcc06fa53852"))
-        responseHeaders.put("X-GP-PROTO", List("1"))
-        responseHeaders.put("Cache-Control", List("no-cache"))
-        responseHeaders.put("Connection", List("close"))
+        responseHeaders.put("Content-type", List("text/plain").asJava)
+        responseHeaders.put("Expires", List("0").asJava)
+        responseHeaders.put("X-GPFDIST-VERSION", List("6.8.1 build commit:7118e8aca825b743dd9477d19406fcc06fa53852").asJava)
+        responseHeaders.put("X-GP-PROTO", List("1").asJava)
+        responseHeaders.put("Cache-Control", List("no-cache").asJava)
+        responseHeaders.put("Connection", List("close").asJava)
         exchange.sendResponseHeaders(200, 0)
+        logInfo(s"GET for GP segment ${segmentId} enter")
         val os = exchange.getResponseBody
-        //val nBytes = rmiSlave.size
-        //logger.debug(s"segmentId=${segmentId} writing ${nBytes}")
         val start = System.currentTimeMillis() // System.nanoTime() //
-        var data = rmiSlave.get(10000)
+        var data = progressTracker.trackProgress("rmiGetMs") {
+          rmiSlave.read(10000)
+        }
         var nBytes: Long = 0
-        while (data != null) {
+        var nChunks: Long = 0
+        while ((data != null) && (data.position() > 0)) {
           //os.write(data.getBytes(StandardCharsets.UTF_8))
-          nBytes += data.length
-          os.write(data)
-          data = rmiSlave.get(10000)
+          nChunks += 1
+          nBytes += data.position()
+          progressTracker.trackProgress("webWriteMs") {
+            os.write(data.array(), 0, data.position())
+          }
+          progressTracker.trackProgress("rmiGetMs") {
+            rmiSlave.recycleBuffer(data)
+            data = rmiSlave.read(10000)
+          }
+        }
+        progressTracker.trackProgress("webWriteMs") {
+          os.flush()
+          os.close()
         }
         val ms = System.currentTimeMillis() - start
         rmiLoopMs.addAndGet(ms)
-        os.flush()
-        os.close()
-        logger.debug(s"GET for GP segment ${segmentId} complete in ${ms}/${System.currentTimeMillis() - start}ms, nBytes=${nBytes}")
+        processingMs.addAndGet(ms)
+        totalBytes.addAndGet(nBytes)
+        webLoopMs.set(progressTracker.results.getOrElse("webWriteMs", 0))
+        logInfo(s"GET for GP segment ${segmentId} complete in ${ms}ms, " +
+          s"nBytes=${nBytes} in $nChunks pieces, ${progressTracker.reportTimeTaken()}")
+      /***************************************************/
+      /**********************-POST-***********************/
+      /***************************************************/
       } else if (method == "post") me.synchronized {
         val passStart = System.currentTimeMillis()
         var rmiMsTotal: Long = 0
         var bytesReadTotal: Int = 0
-        if (activeWriters.isEmpty) {
-          segmentCount.set(headers.get("X-gp-segment-count").toList match {
-            case values: List[String] => values.head.toInt
-            case _ => throw new Exception(s"No X-GP-SEGMENT-COUNT")
-          })
-          logger.debug(s"Starting download for ${targetName} with segmentId=${segmentId}")
-        }
+        logTrace(s"""Headers:\n${headers.asScala.mkString("\n")}""")
         var gpSeq: Int = 0
         if (headers.containsKey("X-gp-seq"))
-          gpSeq = headers.get("X-gp-seq").toList match {
-            case values: List[String] => values.head.toInt
+          gpSeq = headers.get("X-gp-seq").asScala match {
+            case values: mutable.Buffer[String] => values.head.toInt
             case _ => 0
           }
+        if (gpSeq == 1) {
+          // Segment transfer initiation
+          segmentCount.addAndGet(1)
+          val nTotalSeg = headers.get("X-gp-segment-count").asScala match {
+            case values: mutable.Buffer[String] => values.head.toInt
+            case _ => 0 //throw new Exception(s"No X-GP-SEGMENT-COUNT")
+          }
+          logDebug(s"POST: starting download for segmentId=$segmentId ${targetName}, " +
+            s"segmentCount=${segmentCount.get()}, X-gp-segment-count=$nTotalSeg")
+        }
         var segmentDone: Int = 0
         if (headers.containsKey("X-gp-done"))
-          segmentDone = headers.get("X-gp-done").toList match {
-            case values: List[String] => values.head.toInt
+          segmentDone = headers.get("X-gp-done").asScala match {
+            case values: mutable.Buffer[String] => values.head.toInt
             case _ => 0
           }
-        if (!activeWriters.containsKey(segmentId)) {
+        if (!activeWriters.contains(segmentId)) {
           activeWriters.put(segmentId, segmentDone)
           segmentQueues.put(segmentId, Array.empty[Byte])
         }
-        segPass.put(segmentId, segPass.getOrElse(segmentId, 0) + 1)
+        val thisSegPass = segPass.getOrElse(segmentId, 0) + 1
+        segPass.put(segmentId, thisSegPass)
         var nSlices: Int = 0
         val is = exchange.getRequestBody
         if (!jobAbort.get()) {
@@ -142,25 +181,29 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
                     var avBreak: Boolean = false
                     while (is.available() < contentLength && !avBreak) {
                       if (System.currentTimeMillis() - passStart > 1000) {
-                        logger.warn(s"caller ${exchange.getRemoteAddress}: body stream hanged, available so far ${is.available()}")
+                        logWarning(s"caller ${exchange.getRemoteAddress}: body stream hanged, available so far ${is.available()}")
                         avBreak = true
                       }
                       Thread.sleep(10)
                     }
           */
-          var nRead = is.read(buff, prevLen, contentLength)
+          var nRead = progressTracker.trackProgress("webReadMs") {
+            is.read(buff, prevLen, contentLength)
+          }
           while ((nRead > 0) && !jobAbort.get()) {
             nSlices += 1
 /*
-            logger.debug(s"read: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
+            logDebug(s"read: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
               s" slice=${nSlices} nRead=${nRead} " +
               //s"${convertBytesToHex(buff.slice(0, Math.min(nRead, 10)))} " +
               s".. ")
 */
             bytesReadTotal += nRead
             if ((bytesReadTotal < contentLength) && !jobAbort.get()) {
-              //logger.debug(s"caller: ${exchange.getRemoteAddress} will block, bytesReadTotal=${bytesReadTotal}")
-              nRead = is.read(buff, prevLen + bytesReadTotal, contentLength - bytesReadTotal)
+              logTrace(s"caller: ${exchange.getRemoteAddress} will block, bytesReadTotal=${bytesReadTotal}")
+              nRead = progressTracker.trackProgress("webReadMs") {
+                is.read(buff, prevLen + bytesReadTotal, contentLength - bytesReadTotal)
+              }
             } else {
               nRead = -1
             }
@@ -178,12 +221,14 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
               //val data: String = new String(buff.slice(0, eolIx + 1), StandardCharsets.UTF_8)
               val data = buff.slice(0, eolIx + 1)
               val start = System.currentTimeMillis() // System.nanoTime() //
-              logger.debug(s"write: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
+              logDebug(s"write: segment ${segmentId} gpSeq=${gpSeq} pass=${segPass.getOrElse(segmentId, 0)}" +
                 s" nSlices=${nSlices} bytes=${data.length} " +
                 //s"${convertBytesToHex(data.slice(0, Math.min(data.length, 10)))} " +
                 s".. ")
-              rmiSlave.write(data)
-              //logger.debug(s"write: segment ${segmentId} ok")
+              progressTracker.trackProgress("rmiWriteMs") {
+                rmiSlave.write(data)
+              }
+              //logDebug(s"write: segment ${segmentId} ok")
               rmiLoopMs.addAndGet(System.currentTimeMillis() - start)
               rmiMsTotal += System.currentTimeMillis() - start
             } else {
@@ -192,52 +237,79 @@ class WebServer(port: Int, rmiSlave: RMISlave, jobAbort: AtomicBoolean, transfer
 
             if (tail.nonEmpty) {
               if (segmentDone != 0) {
-                logger.error(s"Truncated row received in GP segment ${segmentId}")
+                logError(s"Truncated row received in GP segment ${segmentId}")
                 jobAbort.set(true)
               }
             }
             segmentQueues.put(segmentId, tail)
           }
         }
+      /*
         val nWritersDone = activeWriters.values.sum
         if (nWritersDone == segmentCount.get()) {
           segmentQueues.clear()
           activeWriters.clear()
           allSegmentsDone.set(true)
         }
+      */
         val responseHeaders = exchange.getResponseHeaders
         val rCod = if (!jobAbort.get()) 200 else 500
         responseHeaders.remove("Transfer-encoding")
-        responseHeaders.put("Content-type", List("text/plain"))
-        responseHeaders.put("Expires", List("0"))
-        responseHeaders.put("X-GPFDIST-VERSION", List("6.8.1 build commit:7118e8aca825b743dd9477d19406fcc06fa53852"))
-        responseHeaders.put("X-GP-PROTO", List("0"))
-        responseHeaders.put("Cache-Control", List("no-cache"))
-        responseHeaders.put("Connection", List("close"))
-        is.close()
+        responseHeaders.put("Content-type", List("text/plain").asJava)
+        responseHeaders.put("Expires", List("0").asJava)
+        responseHeaders.put("X-GPFDIST-VERSION", List("6.8.1 build commit:7118e8aca825b743dd9477d19406fcc06fa53852").asJava)
+        responseHeaders.put("X-GP-PROTO", List("0").asJava)
+        responseHeaders.put("Cache-Control", List("no-cache").asJava)
+        responseHeaders.put("Connection", List("close").asJava)
+        progressTracker.trackProgress("webReadMs") {
+          is.close()
+        }
         exchange.sendResponseHeaders(rCod, 0)
         val os = exchange.getResponseBody
         os.flush()
         os.close()
+        processingMs.addAndGet(System.currentTimeMillis() - passStart)
+        totalBytes.addAndGet(bytesReadTotal)
         if (segmentDone == 0) {
-          logger.debug(s"caller: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
-            s"pass=${segPass.getOrElse(segmentId, 0)} bytesReadPass=${bytesReadTotal} in " +
+          logDebug(s"POST: ${exchange.getRemoteAddress} segmentId=${segmentId} gpSeq=${gpSeq} " +
+            s"pass=${thisSegPass} bytesReadPass=${bytesReadTotal} in " +
             s"timeMs=${System.currentTimeMillis() - passStart}, rmiMs=${rmiMsTotal}, nSlices=${nSlices}")
         } else {
-          if (!transferComplete.get() && !jobAbort.get())
-            rmiSlave.flush
-          logger.debug(s"caller transfer complete: ${exchange.getRemoteAddress} segment ${segmentId} gpSeq=${gpSeq} " +
-            s"pass=${segPass.getOrElse(segmentId, 0)} bytesReadPass=${bytesReadTotal}, nSlices=${nSlices}")
+          segmentDoneCount.addAndGet(1)
+          if (!jobAbort.get()) {
+            progressTracker.trackProgress("rmiWriteMs") {
+              rmiSlave.flush()
+            }
+          }
+          if ((contentLength == 0) && (gpSeq > 1))
+            transferComplete.set(true)
+          logDebug(s"POST: segment transfer complete for segmentId=${segmentId} ${exchange.getRemoteAddress}, " +
+            s"gpSeq=${gpSeq}, all segments: started=${segmentCount.get()}, complete=${segmentDoneCount.get()}, " +
+            s"totalBytes=${totalBytes.get()}, processingMs=${processingMs.get()}, sqlComplete=${transferComplete.get()}"
+            )
         }
+        webLoopMs.set(progressTracker.results.getOrElse("webReadMs", 0))
+        /*
         if (jobAbort.get() || allSegmentsDone.get()) {
           if (jobAbort.get()) {
-            logger.debug(s"Query aborted, sent ${rCod} response code")
+            logInfo(s"POST for GP segment ${segmentId} aborted after ${processingMs.get()}ms, " +
+              s"nBytes=${totalBytes.get()} in ${segPass.getOrElse(segmentId, 0)} pieces, " +
+              s"rmiLoopMs=${rmiLoopMs.get()}, " +
+              s"${progressTracker.reportTimeTaken()}")
           } else {
-            logger.debug(s"All segments done, sent ${rCod} response code")
+            progressTracker.trackProgress("rmiWriteMs") {
+              rmiSlave.flush()
+            }
+            logInfo(s"POST for ${segmentCount.get()} GP segments complete in ${processingMs.get()}ms, " +
+              s"nBytes=${totalBytes.get()} in ${segPass.getOrElse(segmentId, 0)} pieces, " +
+              s"rmiLoopMs=${rmiLoopMs.get()}, " +
+              s"${progressTracker.reportTimeTaken()}")
+            Thread.sleep(20)
           }
           transferComplete.set(true)
         }
-      }
+        */
+      } //post
     }
   })
   server.setExecutor(executor)

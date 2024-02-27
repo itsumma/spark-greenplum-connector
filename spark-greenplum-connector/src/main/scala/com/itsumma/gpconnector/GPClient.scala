@@ -1,9 +1,8 @@
 package com.itsumma.gpconnector
 
 import com.itsumma.gpconnector.GPClient.makeConnProps
-import com.typesafe.scalalogging.Logger
+import org.apache.spark.internal.Logging
 import org.apache.spark.sql.itsumma.gpconnector.GPOptionsFactory
-import org.slf4j.LoggerFactory
 
 import java.sql.{Connection, DriverManager, SQLWarning}
 import java.util.Properties
@@ -11,7 +10,7 @@ import scala.language.{postfixOps, reflectiveCalls}
 import scala.util.Try
 import scala.collection.mutable.{HashMap => MutableHashMap, Map => MutableMap}
 
-case class GPClient(optionsFactory: GPOptionsFactory) {
+class GPClient(optionsFactory: GPOptionsFactory) {
   import org.apache.commons.dbcp2.BasicDataSource
   private var pool: BasicDataSource = null
 
@@ -42,11 +41,9 @@ case class GPClient(optionsFactory: GPOptionsFactory) {
 
 }
 
-case object GPClient {
+case object GPClient extends Logging {
 
   import java.net.{InetAddress, InetSocketAddress, ServerSocket}
-//  private val logger = Logger(LoggerFactory.getLogger(this.getClass))
-  private val logger = Logger("com.itsumma.gpconnector.GPClient")
 
   private def makeConnProps(optionsFactory: GPOptionsFactory): Properties = {
     val props = optionsFactory.getJDBCOptions().asProperties
@@ -86,9 +83,9 @@ case object GPClient {
       val msg = warning.getMessage
       val state = warning.getSQLState
       msgLogLevel match {
-        case "DEBUG" => logger.debug(s"${state}: ${msg}")
-        case "INFO" => logger.info(s"${state}: ${msg}")
-        case "WARN" => logger.warn(s"${state}: ${msg}")
+        case "DEBUG" => logDebug(s"${state}: ${msg}")
+        case "INFO" => logInfo(s"${state}: ${msg}")
+        case "WARN" => logWarning(s"${state}: ${msg}")
         case _ =>
       }
       warning = warning.getNextWarning
@@ -132,14 +129,14 @@ case object GPClient {
       }
     }
     if (!schemaExists) {
-      logger.info(s"Will create DB schema ${schemaName} because it doesn't exists..")
+      logInfo(s"Will create DB schema ${schemaName} because it doesn't exists..")
       GPClient.using(conn.createStatement()) {
         st => st.executeUpdate(s"create schema ${schemaName}")
       }
       if (!conn.getAutoCommit)
         conn.commit()
     } else {
-      logger.info(s"DB schema ${schemaName} exists.")
+      logInfo(s"DB schema ${schemaName} exists.")
     }
     !schemaExists
   }
@@ -182,7 +179,7 @@ case object GPClient {
         }
       }
     }
-    logger.info(s"Current GP name space search path: ${getDbObjSearchPath(conn)}")
+    logInfo(s"Current GP name space search path: ${getDbObjSearchPath(conn)}")
     ret
   }
 

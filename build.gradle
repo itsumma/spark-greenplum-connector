@@ -1,7 +1,7 @@
 allprojects  {
   //apply plugin: 'maven'
   group = 'com.itsumma'
-  version = '2.1.0'
+  version = '3.1.0'
 }
 
 subprojects {
@@ -21,14 +21,14 @@ subprojects {
 
   
   dependencies {
-    implementation group: 'org.postgresql', name: 'postgresql', version:'42.4.3'
-    implementation group: 'com.typesafe.scala-logging', name: 'scala-logging_2.11', version:'3.8.0'
-//    testImplementation group: 'org.scalatest', name: 'scalatest_2.11', version:'3.1.1'
-    compileOnly group: 'org.scala-lang', name: 'scala-library', version:'2.11.12'
-    compileOnly group: 'org.apache.spark', name: 'spark-core_2.11', version:'2.4.7'
-    compileOnly group: 'org.apache.spark', name: 'spark-sql_2.11', version:'2.4.7'
-    compileOnly group: 'org.apache.spark', name: 'spark-catalyst_2.11', version:'2.4.7'
-    compileOnly group: 'org.apache.spark', name: 'spark-tags_2.11', version:'2.4.7'
+    implementation group: 'org.postgresql', name: 'postgresql', version:'42.7.2'
+//     implementation group: 'com.typesafe.scala-logging', name: 'scala-logging_2.12', version:'3.8.0'
+//    testImplementation group: 'org.scalatest', name: 'scalatest_2.12', version:'3.1.1'
+    compileOnly group: 'org.scala-lang', name: 'scala-library', version:'2.12.17'
+    compileOnly group: 'org.apache.spark', name: 'spark-core_2.12', version:'3.4.1'
+    compileOnly group: 'org.apache.spark', name: 'spark-sql_2.12', version:'3.4.1'
+    compileOnly group: 'org.apache.spark', name: 'spark-catalyst_2.12', version:'3.4.1'
+    compileOnly group: 'org.apache.spark', name: 'spark-tags_2.12', version:'3.4.1'
     }
   
 }

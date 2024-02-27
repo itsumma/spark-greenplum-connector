@@ -1,6 +1,7 @@
 package com.itsumma.gpconnector
 
-import org.apache.spark.sql.sources.v2.reader.streaming.Offset
+import org.apache.spark.sql.connector.read.streaming.Offset
+//org.apache.spark.sql.sources.v2.reader.streaming.Offset
 
 import java.sql.Connection
 import java.time.LocalDateTime

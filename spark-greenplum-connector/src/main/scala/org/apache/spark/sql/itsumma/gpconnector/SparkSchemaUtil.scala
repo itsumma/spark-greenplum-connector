@@ -6,13 +6,15 @@ import java.time.{Instant, OffsetDateTime, ZoneId}
 import java.time.format.DateTimeFormatter
 import java.time.temporal._
 import com.itsumma.gpconnector.GPClient
-import org.apache.commons.lang.StringEscapeUtils
-import org.apache.commons.lang.time.FastDateFormat
+import org.apache.commons.text.StringEscapeUtils
+import org.apache.commons.lang3.time.FastDateFormat
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.SpecificInternalRow
 import org.apache.spark.sql.execution.datasources.jdbc.JdbcUtils
 import SparkSchemaUtil.rightPadWithChar
+import org.apache.commons.lang3.StringUtils
 import org.apache.spark.SparkContext
+import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column}
 import org.apache.spark.sql.itsumma.gpconnector.GpTableTypes.GpTableType
 import org.apache.spark.sql.jdbc.{JdbcDialect, JdbcDialects}
 import org.apache.spark.sql.sources._
@@ -21,7 +23,7 @@ import org.apache.spark.unsafe.types.UTF8String
 
 import scala.collection.mutable.{HashMap => MutableHashMap}
 
-//import org.apache.commons.lang.StringUtils.rightPad
+//import org.apache.commons.text.StringUtils.rightPad
 import SparkSchemaUtil.{escapeKey, isClass}
 
 case class GPColumnMeta(sqlTypeId: Int, dbTypeName: String, nullable: Int, colSize: Integer, decimalDigits: Integer) {}
@@ -478,6 +480,7 @@ object SparkSchemaUtil {
     guess
   }
 
+  def schema2Columns(schema: StructType): Array[Column] = CatalogV2Util.structTypeToV2Columns(schema)
 }
 
 case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefault.toString) {
@@ -505,17 +508,22 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
       GP_DATE_FORMAT)
   }
 
+  private def escapeSql(str: String): String = {
+    if (str == null) return null
+    StringUtils.replace(str, "'", "''")
+  }
+
   // Helper function to escape string values in SQL queries
   private def compileValue(value: Any): Any = value match {
-    case stringValue: String => s"'${StringEscapeUtils.escapeSql(stringValue)}'"
+    case stringValue: String => s"'${escapeSql(stringValue)}'"
 
     case timestampValue: Timestamp => getTimestampString(timestampValue)
 
     case dateValue: Date => getDateString(dateValue)
 
-    case utf if (isClass(utf, "org.apache.spark.sql.types.UTF8String")) => s"'${StringEscapeUtils.escapeSql(utf.toString)}'"
+    case utf if (isClass(utf, "org.apache.spark.sql.types.UTF8String")) => s"'${escapeSql(utf.toString)}'"
     // Spark 1.5
-    case utf if (isClass(utf, "org.apache.spark.unsafe.types.UTF8String")) => s"'${StringEscapeUtils.escapeSql(utf.toString)}'"
+    case utf if (isClass(utf, "org.apache.spark.unsafe.types.UTF8String")) => s"'${escapeSql(utf.toString)}'"
 
     // Pass through anything else
     case _ => value

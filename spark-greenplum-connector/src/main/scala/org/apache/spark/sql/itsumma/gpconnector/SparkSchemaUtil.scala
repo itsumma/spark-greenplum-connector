@@ -684,7 +684,7 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
             }
           }
         }
-        case DateType => if (!isNull) row.setInt(i, txt.toInt) else row.setInt(i, 0)
+        case DateType => {
           if (isNull) {
             row.setInt(i, 0)
           } else {
@@ -692,6 +692,7 @@ case class SparkSchemaUtil(dbTimeZoneName: String = java.time.ZoneId.systemDefau
             val epochDay = ld.getLong(ChronoField.EPOCH_DAY)
             row.setInt(i, epochDay.toInt)
           }
+        }
         case BooleanType => {
           if (!isNull) {
             //row.setBoolean(i, txt.toBoolean)

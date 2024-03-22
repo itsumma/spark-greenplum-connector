@@ -394,6 +394,12 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     if (!isReadTransaction) {
       isServiceProvider = !address2Seg.contains(pcb.nodeIp) ||
         (seg2ServiceProvider.getOrElse(pcb.gpSegmentId, null) == pcb.handler.asInstanceOf[ITSIpcClient])
+      if (isServiceProvider && (pcb.gpSegmentId == null) && (func == "checkIn")) {
+        if (seg2ServiceProvider.keySet.size >= nGpSegments) {
+          // We have more worker hosts than GP segments number
+          isServiceProvider = false
+        }
+      }
     }
     func match {
       case "checkIn" =>
@@ -502,7 +508,6 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     val hostAddress = pcb.nodeIp //client.hostAddress
     if ((segId != null) || client2Segment.contains(client))
       throw new Exception(s"Second attempt to connect ${pcb}")
-    var segSet = address2Seg.getOrElse(hostAddress, Set[String]())
     val segmentServiceCounts = client2Segment groupBy (_._2) mapValues (_.size)
     var candidateSegments: Set[String] = Set[String]()
     if (isServiceHolder) {
@@ -513,13 +518,18 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
         candidateSegments = Set[String]()
       }
       if (candidateSegments.isEmpty) {
+        //val nSeg = math.max(if (!isReadTransaction) nParallelTasks else nGpSegments, nGpSegments)
         candidateSegments = (for (id <- 0 until nGpSegments) yield id.toString).toSet
           .filter(id => !segmentServiceCounts.contains(id))
       }
       candidateSegments --= seg2ServiceProvider.keySet
     } else {
-      // Make satellite executors (write only) to be always situated on the same host as its master
-      candidateSegments = segSet
+      candidateSegments = address2Seg.getOrElse(hostAddress, Set[String]())
+      if (candidateSegments.isEmpty) {
+        // Will make a satellite writer situated on the separate worker host (workers number > segments number)
+        candidateSegments ++= seg2ServiceProvider.keySet // adhere to any master available
+        logDebug(s"Making satellite writer on the separate worker: pcb=${pcb} candidateSegments=${candidateSegments}")
+      }
     }
     if (candidateSegments.isEmpty)
       throw new Exception(s"Unable to assign GP segment to the ITSIpcClient instance ${pcb}")
@@ -529,34 +539,17 @@ class RMIMaster(optionsFactory: GPOptionsFactory,
     val countsAsc = ListMap(candidateUseCounts.toSeq.sortBy(_._2): _*)
     segId = countsAsc.head._1
 
-    /*
-        if (segSet.nonEmpty) {
-          // If clients GPF host already has any GP segments to serve then choose one of them randomly
-          val arr = segSet.toArray
-          val ix = rnd.nextInt(arr.length)
-          segId = arr(ix)
-        } else {
-          // If clients GPF host doesn't yet serve any GP segment then assign him the least served one
-          val zeroCounts = (for (id <- 0 until nGpSegments) yield (id.toString, 0)).toMap
-          val notServedSegments = zeroCounts.filter(entry => !segmentServiceCounts.contains(entry._1))
-          val allCounts = segmentServiceCounts.++(notServedSegments)
-          val countsAsc = ListMap(allCounts.toSeq.sortBy(_._2):_*)
-          segId = countsAsc.head._1
-        }
-    */
     if ((segId == null) || segId.isEmpty)
       throw new Exception(s"Unable to assign GP segment to the ITSIpcClient instance ${client}")
     if (isServiceHolder) {
       if (seg2ServiceProvider.contains(segId))
         throw new Exception(s"Segment ${segId} already has a gpfdist instance holder")
       seg2ServiceProvider.put(segId, client)
-    }
-    client2Segment.put(client, segId)
-    if (isServiceHolder) {
-      if (!segSet.contains(segId))
-        segSet = segSet + segId
+      var segSet = candidateSegments
+      if (!segSet.contains(segId)) segSet = segSet + segId
       address2Seg.put(hostAddress, segSet)
     }
+    client2Segment.put(client, segId)
     segId
   }
 

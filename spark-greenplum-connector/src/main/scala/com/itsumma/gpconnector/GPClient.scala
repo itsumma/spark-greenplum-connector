@@ -274,10 +274,11 @@ case object GPClient extends Logging {
    * @param conn DB connection
    * @param tblSchema schema (namespace) of the table
    * @param tblName table name without namespace
-   * @param tblKind table storage kind: h=heap, a=append-optimized, c=column-oriented, v=virtual, x=external table
    * @return distribution clause of DML
    */
-  def getTableDistributionPolicy(conn: Connection, tblSchema: String, tblName: String, tblKind: String = "h"): String = {
+  def getTableDistributionPolicy(conn: Connection, tblSchema: String, tblName: String
+                                 /*, tblKind: String = "h"*/
+                                ): String = {
     var ret: String = ""
     val schemas = if (tblSchema == null || tblSchema.isEmpty)
         """"$user",public""".split(",")
@@ -289,13 +290,13 @@ case object GPClient extends Logging {
          |       join pg_namespace n on (c.relnamespace = n.oid)
          |where  n.nspname = any (?)
          |       and c.relname = ?
-         |       and c.relstorage = ?
+         |       /*and c.relstorage = ?*/
          |order by n.nspname, c.relname limit 1""".stripMargin
     using(conn.prepareStatement(query)) {
       statement => {
         statement.setArray(1, sqlArr)
         statement.setString(2, tblName)
-        statement.setString(3, tblKind)
+        //statement.setString(3, tblKind)
         using(statement.executeQuery()) {
           rs => {
             while (rs.next())

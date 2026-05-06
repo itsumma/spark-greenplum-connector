@@ -27,7 +27,7 @@
         <scala.version>2.12.17</scala.version>
         <scala.binary.version>2.12</scala.binary.version>
         <project.binary.version>3.1</project.binary.version>
-        <postgresql.ver>42.7.2</postgresql.ver>
+        <postgresql.ver>42.7.11</postgresql.ver>
 <!--        <scala-maven-plugin.version>4.5.4</scala-maven-plugin.version>-->
         <scala-maven-plugin.version>3.3.1</scala-maven-plugin.version>
         <hadoop.version>3.3.6</hadoop.version>
